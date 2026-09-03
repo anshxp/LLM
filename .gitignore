@@ -1,0 +1,104 @@
+# =========================
+# Python cache
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+
+# =========================
+# Virtual environments
+# =========================
+.venv/
+venv/
+env/
+ENV/
+
+
+
+# =========================
+# Pytest
+# =========================
+.pytest_cache/
+.coverage
+htmlcov/
+.coverage.*
+
+
+# =========================
+# Environment / secrets
+# =========================
+.env
+.env.*
+!.env.example
+
+# =========================
+# Data / datasets
+# =========================
+data/
+
+# =========================
+# ML / LLM model files
+# =========================
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.h5
+*.keras
+
+# Model/checkpoint directories
+checkpoints/
+models/
+weights/
+
+# =========================
+# Training outputs
+# =========================
+runs/
+outputs/
+logs/
+
+# =========================
+# Evaluation generated files
+# =========================
+evaluation/results/
+evaluation/outputs/
+
+# =========================
+# Inference generated files
+# =========================
+inference/outputs/
+
+# =========================
+# Temporary files
+# =========================
+tmp/
+temp/
+*.tmp
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# VS Code / IDE
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# Python packaging
+# =========================
+*.egg-info/
+dist/
+build/
+.eggs/

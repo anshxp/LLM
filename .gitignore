@@ -34,7 +34,11 @@ htmlcov/
 # =========================
 # Data / datasets
 # =========================
-data/
+data/raw
+data/metadata
+data/processed
+data/raw
+
 
 # =========================
 # ML / LLM model files

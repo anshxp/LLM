@@ -1,28 +1,30 @@
+from pathlib import Path
+
 import torch
 
 
 def save_checkpoint(model, optimizer, step, path):
-    checkpoint = {
-        "step": step,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-    }
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    torch.save(checkpoint, path)
-
-
-def load_checkpoint(model, optimizer, path):
-    checkpoint = torch.load(
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "step": step,
+        },
         path,
-        map_location="cpu",
     )
 
-    model.load_state_dict(
-        checkpoint["model_state_dict"]
+
+def load_checkpoint(model, optimizer, path, map_location=None):
+    checkpoint = torch.load(
+        Path(path),
+        map_location=map_location,
+        weights_only=False,
     )
 
-    optimizer.load_state_dict(
-        checkpoint["optimizer_state_dict"]
-    )
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
     return checkpoint["step"]

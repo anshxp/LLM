@@ -4,6 +4,9 @@ import hashlib
 from collections.abc import Iterable
 
 
+NEAR_DUPLICATE_HAMMING_DISTANCE = 12
+
+
 def _shingles(text: str, size: int = 3) -> Iterable[str]:
     words = text.lower().split()
     if len(words) < size:
@@ -34,7 +37,7 @@ def hamming_distance(left: int, right: int) -> int:
 def is_near_duplicate(
     fingerprint: int,
     previous_fingerprints: Iterable[int],
-    max_hamming_distance: int = 6,
+    max_hamming_distance: int = NEAR_DUPLICATE_HAMMING_DISTANCE,
 ) -> bool:
     """Detect highly similar documents using SimHash distance."""
     return any(

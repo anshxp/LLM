@@ -12,10 +12,7 @@ VALID_TEXT = (
 )
 
 
-def test_build_corpus_handles_nested_files_and_content_duplicates(
-    tmp_path,
-    monkeypatch,
-):
+def test_build_corpus_handles_nested_files_duplicates_and_splits(tmp_path, monkeypatch):
     raw = tmp_path / "raw"
     processed = tmp_path / "processed"
     nested = raw / "nested"
@@ -24,23 +21,25 @@ def test_build_corpus_handles_nested_files_and_content_duplicates(
     first = raw / "first.txt"
     duplicate = nested / "duplicate.txt"
     first.write_text(VALID_TEXT, encoding="utf-8")
-    duplicate.write_text(VALID_TEXT.replace("  ", " "), encoding="utf-8")
+    duplicate.write_text(VALID_TEXT.replace("lungs. It", "lungs.  It"), encoding="utf-8")
 
     monkeypatch.setattr(build_module, "RAW_DIR", raw)
+    monkeypatch.setattr(build_module, "PROCESSED_DIR", processed)
     monkeypatch.setattr(build_module, "OUTPUT_FILE", processed / "corpus.txt")
-    monkeypatch.setattr(
-        build_module,
-        "MANIFEST_FILE",
-        processed / "manifest.jsonl",
-    )
+    monkeypatch.setattr(build_module, "MANIFEST_FILE", processed / "manifest.jsonl")
+    monkeypatch.setattr(build_module, "TRAIN_FILE", processed / "train.txt")
+    monkeypatch.setattr(build_module, "VALIDATION_FILE", processed / "validation.txt")
+    monkeypatch.setattr(build_module, "TEST_FILE", processed / "test.txt")
 
     stats = build_module.build_corpus()
 
     assert stats["total_files"] == 2
     assert stats["accepted"] == 1
     assert stats["content_duplicates"] == 1
+    assert stats["train_documents"] + stats["validation_documents"] + stats["test_documents"] == 1
 
     manifest = (processed / "manifest.jsonl").read_text(encoding="utf-8")
     records = [json.loads(line) for line in manifest.splitlines()]
     assert len(records) == 1
     assert records[0]["source"].endswith("first.txt")
+    assert records[0]["split"] in {"train", "validation", "test"}

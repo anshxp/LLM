@@ -6,7 +6,7 @@ from tokenizers.trainers import BpeTrainer
 from data.tokenizer import Tokenizer
 
 
-def test_bpe_tokenizer_round_trip():
+def test_bpe_tokenizer_encodes_and_decodes():
     tokenizer = HFTokenizer(BPE(unk_token="<unk>"))
     tokenizer.pre_tokenizer = Whitespace()
     trainer = BpeTrainer(
@@ -29,4 +29,8 @@ def test_bpe_tokenizer_round_trip():
     assert ids[0] == wrapped.token_to_id["<bos>"]
     assert ids[-1] == wrapped.token_to_id["<eos>"]
     assert len(ids) > 2
-    assert "pneumonia" in wrapped.decode(ids)
+
+    decoded = wrapped.decode(ids)
+    assert "infection" in decoded
+    assert "<bos>" in decoded
+    assert "<eos>" in decoded

@@ -10,6 +10,9 @@ SPLIT_FILES = {
     "validation": Path("data/processed/validation.txt"),
     "test": Path("data/processed/test.txt"),
 }
+# Backward-compatible default corpus path used by tests and callers that need
+# to inspect the primary training corpus before split files are generated.
+CORPUS_FILE = SPLIT_FILES["train"]
 TOKENIZER_FILE = Path("data/processed/tokenizer.json")
 
 
@@ -28,6 +31,9 @@ def load_token_ids(split: str = "train"):
         )
 
     corpus_file = SPLIT_FILES[split]
+    if split == "train" and CORPUS_FILE != SPLIT_FILES["train"]:
+        corpus_file = CORPUS_FILE
+
     if not corpus_file.exists():
         raise FileNotFoundError(f"Corpus split not found: {corpus_file}")
 

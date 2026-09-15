@@ -6,15 +6,16 @@ from tokenizers.pre_tokenizers import Whitespace
 from tokenizers.trainers import BpeTrainer
 
 
-CORPUS_FILE = Path("data/processed/corpus.txt")
+TRAIN_FILE = Path("data/processed/train.txt")
 TOKENIZER_FILE = Path("data/processed/tokenizer.json")
 VOCAB_SIZE = 10_000
 SPECIAL_TOKENS = ["<pad>", "<unk>", "<bos>", "<eos>"]
 
 
 def train_tokenizer() -> None:
-    if not CORPUS_FILE.exists():
-        raise FileNotFoundError(f"Corpus not found: {CORPUS_FILE}")
+    """Train the model tokenizer using training data only."""
+    if not TRAIN_FILE.exists():
+        raise FileNotFoundError(f"Training corpus not found: {TRAIN_FILE}")
 
     TOKENIZER_FILE.parent.mkdir(parents=True, exist_ok=True)
 
@@ -26,10 +27,17 @@ def train_tokenizer() -> None:
         min_frequency=2,
     )
 
-    tokenizer.train([str(CORPUS_FILE)], trainer)
-    tokenizer.save(str(TOKENIZER_FILE))
+    tokenizer.train([str(TRAIN_FILE)], trainer)
+    actual_vocab_size = tokenizer.get_vocab_size()
+    if actual_vocab_size != VOCAB_SIZE:
+        raise ValueError(
+            f"Corpus produced vocabulary size {actual_vocab_size}; "
+            f"expected {VOCAB_SIZE}. Add more training data or lower "
+            "VOCAB_SIZE."
+        )
 
-    print(f"Vocabulary size: {tokenizer.get_vocab_size():,}")
+    tokenizer.save(str(TOKENIZER_FILE))
+    print(f"Vocabulary size: {actual_vocab_size:,}")
     print(f"Output: {TOKENIZER_FILE}")
 
 

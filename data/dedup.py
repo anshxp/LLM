@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterable
 
 
@@ -14,7 +15,7 @@ def simhash(text: str, bits: int = 64) -> int:
     """Return a deterministic SimHash fingerprint for normalized text."""
     weights = [0] * bits
     for shingle in _shingles(text):
-        digest = __import__("hashlib").sha256(shingle.encode("utf-8")).digest()
+        digest = hashlib.sha256(shingle.encode("utf-8")).digest()
         value = int.from_bytes(digest[: bits // 8], "big")
         for bit in range(bits):
             weights[bit] += 1 if value & (1 << bit) else -1

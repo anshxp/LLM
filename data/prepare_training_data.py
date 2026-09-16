@@ -11,6 +11,8 @@ SPLIT_FILES = {
     "test": Path("data/processed/test.txt"),
 }
 TOKENIZER_FILE = Path("data/processed/tokenizer.json")
+# Backward-compatible alias used by the Phase 3 training-data tests.
+CORPUS_FILE = SPLIT_FILES["train"]
 
 
 def load_token_ids(split: str = "train"):
@@ -28,6 +30,8 @@ def load_token_ids(split: str = "train"):
         )
 
     corpus_file = SPLIT_FILES[split]
+    if split == "train" and CORPUS_FILE != SPLIT_FILES["train"]:
+        corpus_file = CORPUS_FILE
     if not corpus_file.exists():
         raise FileNotFoundError(f"Corpus split not found: {corpus_file}")
 

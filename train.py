@@ -43,6 +43,8 @@ def parse_args(args=None):
 
 
 def resolve_device(requested):
+    if requested not in {"auto", "cpu", "cuda"}:
+        raise ValueError(f"Unknown device choice: {requested}")
     if requested == "cuda":
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA was requested but is not available")
@@ -126,10 +128,15 @@ def main(args=None):
             accumulation_count += 1
 
             is_update = accumulation_count == args.gradient_accumulation_steps
-            is_last_batch = batch_index + 1 == len(train_loader)
+            reached_limit = (
+                args.max_train_batches is not None
+                and batch_index + 1 >= args.max_train_batches
+            )
+            is_last_batch = batch_index + 1 == len(train_loader) or reached_limit
             if is_update or is_last_batch:
-                if accumulation_count < args.gradient_accumulation_steps:
-                    scale = args.gradient_accumulation_steps / accumulation_count
+                current_accumulation = accumulation_count
+                if current_accumulation < args.gradient_accumulation_steps:
+                    scale = args.gradient_accumulation_steps / current_accumulation
                     for parameter in model.parameters():
                         if parameter.grad is not None:
                             parameter.grad.mul_(scale)
@@ -140,7 +147,7 @@ def main(args=None):
                 accumulation_count = 0
 
                 if global_step == 1 or global_step % args.log_every == 0:
-                    average_loss = running_loss / args.gradient_accumulation_steps
+                    average_loss = running_loss / current_accumulation
                     print(f"Epoch {epoch + 1}/{args.epochs} | Step {global_step} | Loss {average_loss:.4f}")
                     running_loss = 0.0
 

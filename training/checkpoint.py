@@ -3,7 +3,8 @@ from pathlib import Path
 import torch
 
 
-def save_checkpoint(model, optimizer, step, path):
+def save_checkpoint(model, optimizer, step, path, epoch=0, batch_index=0):
+    """Save model, optimizer, and training progress for reliable resume."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -12,12 +13,15 @@ def save_checkpoint(model, optimizer, step, path):
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "step": step,
+            "epoch": epoch,
+            "batch_index": batch_index,
         },
         path,
     )
 
 
 def load_checkpoint(model, optimizer, path, map_location=None):
+    """Restore a checkpoint and return its optimizer step."""
     checkpoint = torch.load(
         Path(path),
         map_location=map_location,

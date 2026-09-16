@@ -24,9 +24,11 @@ def test_bpe_tokenizer_round_trip():
     )
 
     wrapped = Tokenizer(tokenizer)
-    ids = wrapped.encode("pneumonia infection", add_bos=True, add_eos=True)
+    original = "pneumonia infection"
+    ids = wrapped.encode(original, add_bos=True, add_eos=True)
 
     assert ids[0] == wrapped.token_to_id["<bos>"]
     assert ids[-1] == wrapped.token_to_id["<eos>"]
     assert len(ids) > 2
-    assert "pneumonia" in wrapped.decode(ids)
+    decoded = wrapped.decode(ids)
+    assert decoded.replace("<bos>", "").replace("<eos>", "").strip() == original

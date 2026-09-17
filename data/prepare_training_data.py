@@ -4,20 +4,28 @@ from config.model_config import ModelConfig
 from data.dataset import LanguageModelDataset
 from data.tokenizer import Tokenizer
 
-
 SPLIT_FILES = {
-    "train": Path("data/processed/train.txt"),
-    "validation": Path("data/processed/validation.txt"),
-    "test": Path("data/processed/test.txt"),
+    "base": {
+        "train": Path("data/processed/train.txt"),
+        "validation": Path("data/processed/validation.txt"),
+        "test": Path("data/processed/test.txt"),
+    },
+    "healthcare": {
+        "train": Path("data/processed/healthcare_train.txt"),
+        "validation": Path("data/processed/healthcare_validation.txt"),
+        "test": Path("data/processed/healthcare_test.txt"),
+    },
 }
 TOKENIZER_FILE = Path("data/processed/tokenizer.json")
-# Backward-compatible alias used by the Phase 3 training-data tests.
-CORPUS_FILE = SPLIT_FILES["train"]
+BASE_SPLIT_FILES = SPLIT_FILES["base"]
+CORPUS_FILE = BASE_SPLIT_FILES["train"]
 
 
-def load_token_ids(split: str = "train"):
+def load_token_ids(split: str = "train", dataset: str = "base"):
     """Load token IDs for one corpus split using the trained tokenizer."""
-    if split not in SPLIT_FILES:
+    if dataset not in SPLIT_FILES:
+        raise ValueError(f"Unknown dataset: {dataset}. Use base or healthcare.")
+    if split not in SPLIT_FILES[dataset]:
         raise ValueError(f"Unknown split: {split}. Use train, validation, or test.")
 
     config = ModelConfig()
@@ -29,8 +37,8 @@ def load_token_ids(split: str = "train"):
             f"model vocabulary ({config.vocab_size})"
         )
 
-    corpus_file = SPLIT_FILES[split]
-    if split == "train" and CORPUS_FILE != SPLIT_FILES["train"]:
+    corpus_file = SPLIT_FILES[dataset][split]
+    if dataset == "base" and split == "train" and CORPUS_FILE != BASE_SPLIT_FILES["train"]:
         corpus_file = CORPUS_FILE
     if not corpus_file.exists():
         raise FileNotFoundError(f"Corpus split not found: {corpus_file}")
@@ -40,16 +48,16 @@ def load_token_ids(split: str = "train"):
 
     if len(token_ids) <= config.context_length:
         raise ValueError(
-            f"{split} split does not contain enough tokens for the configured "
-            f"context length ({config.context_length})."
+            f"{dataset}/{split} split does not contain enough tokens for the "
+            f"configured context length ({config.context_length})."
         )
 
     return token_ids
 
 
-def create_dataset(split: str = "train"):
+def create_dataset(split: str = "train", dataset: str = "base"):
     config = ModelConfig()
-    token_ids = load_token_ids(split)
+    token_ids = load_token_ids(split, dataset=dataset)
 
     return LanguageModelDataset(
         token_ids=token_ids,
@@ -59,10 +67,14 @@ def create_dataset(split: str = "train"):
 
 
 if __name__ == "__main__":
-    for split in SPLIT_FILES:
-        try:
-            dataset = create_dataset(split)
-        except ValueError as exc:
-            print(f"{split}: unavailable ({exc})")
-            continue
-        print(f"{split}: {len(dataset.token_ids):,} tokens, {len(dataset):,} sequences")
+    for dataset in SPLIT_FILES:
+        for split in SPLIT_FILES[dataset]:
+            try:
+                dataset_obj = create_dataset(split, dataset=dataset)
+            except (FileNotFoundError, ValueError) as exc:
+                print(f"{dataset}/{split}: unavailable ({exc})")
+                continue
+            print(
+                f"{dataset}/{split}: {len(dataset_obj.token_ids):,} tokens, "
+                f"{len(dataset_obj):,} sequences"
+            )

@@ -26,6 +26,7 @@ DEFAULT_CHECKPOINT_DIR = Path("checkpoints")
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser(description="Train the healthcare-focused language model.")
+    parser.add_argument("--dataset", choices=("base", "healthcare"), default="base")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=DEFAULT_GRADIENT_ACCUMULATION_STEPS)
     parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
@@ -82,9 +83,10 @@ def main(args=None):
     device = resolve_device(args.device)
     config = ModelConfig()
 
+    print(f"Dataset: {args.dataset}")
     print("Creating datasets...")
-    train_dataset = create_dataset("train")
-    validation_dataset = create_dataset("validation")
+    train_dataset = create_dataset("train", dataset=args.dataset)
+    validation_dataset = create_dataset("validation", dataset=args.dataset)
     if len(train_dataset) == 0 or len(validation_dataset) == 0:
         raise ValueError("Training and validation splits must contain complete sequences")
 

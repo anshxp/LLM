@@ -20,8 +20,7 @@ SPLIT_JSONL_FILES = {
 def prepare_healthcare_data(source_file: Path = SOURCE_FILE):
     """Validate, split, and format the healthcare corpus for language-model training."""
     records = load_jsonl(source_file)
-    train, validation, test = split_records(records)
-    splits = {"train": train, "validation": validation, "test": test}
+    splits = split_records(records)
 
     for split, split_records_list in splits.items():
         write_jsonl(split_records_list, SPLIT_JSONL_FILES[split])

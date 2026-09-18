@@ -1,4 +1,5 @@
 import argparse
+import math
 from pathlib import Path
 
 import torch
@@ -6,6 +7,7 @@ from torch.utils.data import DataLoader
 
 from config.model_config import ModelConfig
 from data.prepare_training_data import create_dataset
+from data.dataset import LanguageModelDataset
 from evaluation.evaluate import evaluate
 from model.llm import LLM
 from training.checkpoint import load_checkpoint, save_checkpoint
@@ -22,6 +24,10 @@ DEFAULT_LOG_EVERY = 10
 DEFAULT_MAX_TRAIN_BATCHES = None
 DEFAULT_MAX_GRAD_NORM = 1.0
 DEFAULT_CHECKPOINT_DIR = Path("checkpoints")
+DEFAULT_TRAIN_STRIDE = 128
+DEFAULT_EVAL_STRIDE = 256
+DEFAULT_LR_MIN = 3e-5
+DEFAULT_EARLY_STOPPING_PATIENCE = 2
 
 
 def parse_args(args=None):
@@ -40,6 +46,10 @@ def parse_args(args=None):
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--train-stride", type=int, default=DEFAULT_TRAIN_STRIDE)
+    parser.add_argument("--eval-stride", type=int, default=DEFAULT_EVAL_STRIDE)
+    parser.add_argument("--lr-min", type=float, default=DEFAULT_LR_MIN)
+    parser.add_argument("--early-stopping-patience", type=int, default=DEFAULT_EARLY_STOPPING_PATIENCE)
     return parser.parse_args(args)
 
 
@@ -74,6 +84,12 @@ def validate_args(args):
         raise ValueError("max_grad_norm must be positive when provided")
     if args.num_workers < 0:
         raise ValueError("num_workers must be non-negative")
+    if args.train_stride <= 0 or args.eval_stride <= 0:
+        raise ValueError("strides must be positive")
+    if args.lr_min <= 0 or args.lr_min > args.learning_rate:
+        raise ValueError("lr_min must be positive and no greater than learning_rate")
+    if args.early_stopping_patience < 0:
+        raise ValueError("early_stopping_patience must be non-negative")
 
 
 def main(args=None):
@@ -87,6 +103,19 @@ def main(args=None):
     print("Creating datasets...")
     train_dataset = create_dataset("train", dataset=args.dataset)
     validation_dataset = create_dataset("validation", dataset=args.dataset)
+
+    # Rebuild datasets with explicit strides so the training windows overlap.
+    train_dataset = LanguageModelDataset(
+        token_ids=train_dataset.token_ids,
+        context_length=config.context_length,
+        stride=args.train_stride,
+    )
+    validation_dataset = LanguageModelDataset(
+        token_ids=validation_dataset.token_ids,
+        context_length=config.context_length,
+        stride=args.eval_stride,
+    )
+
     if len(train_dataset) == 0 or len(validation_dataset) == 0:
         raise ValueError("Training and validation splits must contain complete sequences")
 
@@ -94,8 +123,8 @@ def main(args=None):
     train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
     validation_loader = DataLoader(validation_dataset, shuffle=False, **loader_kwargs)
 
-    print(f"Training sequences: {len(train_dataset):,}")
-    print(f"Validation sequences: {len(validation_dataset):,}")
+    print(f"Training sequences: {len(train_dataset):,} (stride={args.train_stride})")
+    print(f"Validation sequences: {len(validation_dataset):,} (stride={args.eval_stride})")
     print(f"Device: {device}")
     print(f"Batch size: {args.batch_size} | Gradient accumulation: {args.gradient_accumulation_steps}")
 
@@ -104,12 +133,20 @@ def main(args=None):
     print(f"Parameters: {total_parameters:,}")
 
     optimizer = create_optimizer(model, learning_rate=args.learning_rate, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(1, args.epochs),
+        eta_min=args.lr_min,
+    )
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     global_step = 0
 
     if args.resume is not None:
         global_step = load_checkpoint(model, optimizer, args.resume, map_location=device)
         print(f"Resumed from {args.resume} at optimizer step {global_step}")
+
+    best_validation_loss = math.inf
+    epochs_without_improvement = 0
 
     for epoch in range(args.epochs):
         model.train()
@@ -150,17 +187,46 @@ def main(args=None):
 
                 if global_step == 1 or global_step % args.log_every == 0:
                     average_loss = running_loss / current_accumulation
-                    print(f"Epoch {epoch + 1}/{args.epochs} | Step {global_step} | Loss {average_loss:.4f}")
+                    print(
+                        f"Epoch {epoch + 1}/{args.epochs} | Step {global_step} | "
+                        f"Loss {average_loss:.4f} | LR {optimizer.param_groups[0]['lr']:.2e}"
+                    )
                     running_loss = 0.0
 
         metrics = evaluate(model, validation_loader, device=device)
-        print(f"Validation loss: {metrics['loss']:.4f} | Perplexity: {metrics['perplexity']:.2f}")
+        validation_loss = metrics["loss"]
+        print(
+            f"Validation loss: {validation_loss:.4f} | "
+            f"Perplexity: {metrics['perplexity']:.2f}"
+        )
 
         checkpoint_path = args.checkpoint_dir / f"model_epoch_{epoch + 1}.pt"
         save_checkpoint(model, optimizer, global_step, checkpoint_path, epoch=epoch + 1)
         print(f"Checkpoint saved: {checkpoint_path}")
 
-    print("Training complete.")
+        if validation_loss < best_validation_loss:
+            best_validation_loss = validation_loss
+            epochs_without_improvement = 0
+            best_path = args.checkpoint_dir / "best_model.pt"
+            save_checkpoint(model, optimizer, global_step, best_path, epoch=epoch + 1)
+            print(f"New best model: {best_path} (validation loss={best_validation_loss:.4f})")
+        else:
+            epochs_without_improvement += 1
+            print(
+                f"No validation improvement for {epochs_without_improvement}/"
+                f"{args.early_stopping_patience} epoch(s)"
+            )
+
+        scheduler.step()
+
+        if (
+            args.early_stopping_patience > 0
+            and epochs_without_improvement >= args.early_stopping_patience
+        ):
+            print("Early stopping triggered.")
+            break
+
+    print(f"Training complete. Best validation loss: {best_validation_loss:.4f}")
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from config.model_config import ModelConfig
-from data.prepare_training_data import create_dataset
+from data.prepare_training_data import load_token_ids
 from data.dataset import LanguageModelDataset
 from evaluation.evaluate import evaluate
 from model.llm import LLM
@@ -31,25 +31,45 @@ DEFAULT_EARLY_STOPPING_PATIENCE = 2
 
 
 def parse_args(args=None):
-    parser = argparse.ArgumentParser(description="Train the healthcare-focused language model.")
+    parser = argparse.ArgumentParser(
+        description="Train the healthcare-focused language model."
+    )
     parser.add_argument("--dataset", choices=("base", "healthcare"), default="base")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=DEFAULT_GRADIENT_ACCUMULATION_STEPS)
-    parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=DEFAULT_GRADIENT_ACCUMULATION_STEPS,
+    )
+    parser.add_argument(
+        "--learning-rate", type=float, default=DEFAULT_LEARNING_RATE
+    )
     parser.add_argument("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY)
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument("--log-every", type=int, default=DEFAULT_LOG_EVERY)
-    parser.add_argument("--max-train-batches", type=int, default=DEFAULT_MAX_TRAIN_BATCHES)
-    parser.add_argument("--max-grad-norm", type=float, default=DEFAULT_MAX_GRAD_NORM)
-    parser.add_argument("--checkpoint-dir", type=Path, default=DEFAULT_CHECKPOINT_DIR)
+    parser.add_argument(
+        "--max-train-batches", type=int, default=DEFAULT_MAX_TRAIN_BATCHES
+    )
+    parser.add_argument(
+        "--max-grad-norm", type=float, default=DEFAULT_MAX_GRAD_NORM
+    )
+    parser.add_argument(
+        "--checkpoint-dir", type=Path, default=DEFAULT_CHECKPOINT_DIR
+    )
     parser.add_argument("--resume", type=Path, default=None)
-    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument(
+        "--device", choices=("auto", "cpu", "cuda"), default="auto"
+    )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train-stride", type=int, default=DEFAULT_TRAIN_STRIDE)
     parser.add_argument("--eval-stride", type=int, default=DEFAULT_EVAL_STRIDE)
     parser.add_argument("--lr-min", type=float, default=DEFAULT_LR_MIN)
-    parser.add_argument("--early-stopping-patience", type=int, default=DEFAULT_EARLY_STOPPING_PATIENCE)
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=DEFAULT_EARLY_STOPPING_PATIENCE,
+    )
     return parser.parse_args(args)
 
 
@@ -92,76 +112,126 @@ def validate_args(args):
         raise ValueError("early_stopping_patience must be non-negative")
 
 
+def build_dataset(split, dataset_name, context_length, stride):
+    token_ids = load_token_ids(split, dataset=dataset_name)
+    return LanguageModelDataset(
+        token_ids=token_ids,
+        context_length=context_length,
+        stride=stride,
+    )
+
+
 def main(args=None):
     args = parse_args(args)
     validate_args(args)
+
     torch.manual_seed(args.seed)
     device = resolve_device(args.device)
     config = ModelConfig()
 
     print(f"Dataset: {args.dataset}")
     print("Creating datasets...")
-    train_dataset = create_dataset("train", dataset=args.dataset)
-    validation_dataset = create_dataset("validation", dataset=args.dataset)
 
-    # Rebuild datasets with explicit strides so the training windows overlap.
-    train_dataset = LanguageModelDataset(
-        token_ids=train_dataset.token_ids,
-        context_length=config.context_length,
-        stride=args.train_stride,
+    train_dataset = build_dataset(
+        "train",
+        args.dataset,
+        config.context_length,
+        args.train_stride,
     )
-    validation_dataset = LanguageModelDataset(
-        token_ids=validation_dataset.token_ids,
-        context_length=config.context_length,
-        stride=args.eval_stride,
+    validation_dataset = build_dataset(
+        "validation",
+        args.dataset,
+        config.context_length,
+        args.eval_stride,
     )
 
     if len(train_dataset) == 0 or len(validation_dataset) == 0:
         raise ValueError("Training and validation splits must contain complete sequences")
 
-    loader_kwargs = {"batch_size": args.batch_size, "num_workers": args.num_workers}
+    loader_kwargs = {
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+    }
     train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
     validation_loader = DataLoader(validation_dataset, shuffle=False, **loader_kwargs)
 
-    print(f"Training sequences: {len(train_dataset):,} (stride={args.train_stride})")
-    print(f"Validation sequences: {len(validation_dataset):,} (stride={args.eval_stride})")
+    print(
+        f"Training sequences: {len(train_dataset):,} "
+        f"(stride={args.train_stride})"
+    )
+    print(
+        f"Validation sequences: {len(validation_dataset):,} "
+        f"(stride={args.eval_stride})"
+    )
     print(f"Device: {device}")
-    print(f"Batch size: {args.batch_size} | Gradient accumulation: {args.gradient_accumulation_steps}")
+    print(
+        f"Batch size: {args.batch_size} | "
+        f"Gradient accumulation: {args.gradient_accumulation_steps}"
+    )
 
     model = LLM(config).to(device)
     total_parameters = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {total_parameters:,}")
 
-    optimizer = create_optimizer(model, learning_rate=args.learning_rate, weight_decay=args.weight_decay)
+    optimizer = create_optimizer(
+        model,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=max(1, args.epochs),
         eta_min=args.lr_min,
     )
+
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    start_epoch = 0
     global_step = 0
 
     if args.resume is not None:
-        global_step = load_checkpoint(model, optimizer, args.resume, map_location=device)
-        print(f"Resumed from {args.resume} at optimizer step {global_step}")
+        resume_state = load_checkpoint(
+            model,
+            optimizer,
+            args.resume,
+            map_location=device,
+            scheduler=scheduler,
+        )
+        global_step = resume_state["step"]
+        start_epoch = resume_state["epoch"]
+        print(
+            f"Resumed from {args.resume} at optimizer step {global_step} "
+            f"(completed epoch {start_epoch})"
+        )
 
     best_validation_loss = math.inf
-    epochs_without_improvement = 0
+    best_path = args.checkpoint_dir / "best_model.pt"
 
-    for epoch in range(args.epochs):
+    # If an existing best checkpoint is present, use its recorded metric only
+    # when it is explicitly supplied as the resume checkpoint. Fresh runs are
+    # intentionally evaluated from scratch.
+    epochs_to_run = args.epochs
+
+    for local_epoch in range(epochs_to_run):
+        display_epoch = start_epoch + local_epoch + 1
         model.train()
         optimizer.zero_grad(set_to_none=True)
         running_loss = 0.0
         accumulation_count = 0
 
         for batch_index, (input_ids, target_ids) in enumerate(train_loader):
-            if args.max_train_batches is not None and batch_index >= args.max_train_batches:
+            if (
+                args.max_train_batches is not None
+                and batch_index >= args.max_train_batches
+            ):
                 break
 
             input_ids = input_ids.to(device)
             target_ids = target_ids.to(device)
+
             logits = model(input_ids)
             loss = language_model_loss(logits, target_ids)
+
             (loss / args.gradient_accumulation_steps).backward()
             running_loss += loss.item()
             accumulation_count += 1
@@ -172,55 +242,85 @@ def main(args=None):
                 and batch_index + 1 >= args.max_train_batches
             )
             is_last_batch = batch_index + 1 == len(train_loader) or reached_limit
+
             if is_update or is_last_batch:
                 current_accumulation = accumulation_count
+
                 if current_accumulation < args.gradient_accumulation_steps:
                     scale = args.gradient_accumulation_steps / current_accumulation
                     for parameter in model.parameters():
                         if parameter.grad is not None:
                             parameter.grad.mul_(scale)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    args.max_grad_norm,
+                )
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+
                 global_step += 1
                 accumulation_count = 0
 
                 if global_step == 1 or global_step % args.log_every == 0:
                     average_loss = running_loss / current_accumulation
                     print(
-                        f"Epoch {epoch + 1}/{args.epochs} | Step {global_step} | "
-                        f"Loss {average_loss:.4f} | LR {optimizer.param_groups[0]['lr']:.2e}"
+                        f"Epoch {display_epoch}/{start_epoch + epochs_to_run} | "
+                        f"Step {global_step} | Loss {average_loss:.4f} | "
+                        f"LR {optimizer.param_groups[0]['lr']:.2e}"
                     )
                     running_loss = 0.0
 
         metrics = evaluate(model, validation_loader, device=device)
         validation_loss = metrics["loss"]
+
         print(
             f"Validation loss: {validation_loss:.4f} | "
             f"Perplexity: {metrics['perplexity']:.2f}"
         )
 
-        checkpoint_path = args.checkpoint_dir / f"model_epoch_{epoch + 1}.pt"
-        save_checkpoint(model, optimizer, global_step, checkpoint_path, epoch=epoch + 1)
+        checkpoint_path = (
+            args.checkpoint_dir / f"model_epoch_{display_epoch}.pt"
+        )
+        save_checkpoint(
+            model,
+            optimizer,
+            global_step,
+            checkpoint_path,
+            epoch=display_epoch,
+            scheduler=scheduler,
+        )
         print(f"Checkpoint saved: {checkpoint_path}")
 
         if validation_loss < best_validation_loss:
             best_validation_loss = validation_loss
-            epochs_without_improvement = 0
-            best_path = args.checkpoint_dir / "best_model.pt"
-            save_checkpoint(model, optimizer, global_step, best_path, epoch=epoch + 1)
-            print(f"New best model: {best_path} (validation loss={best_validation_loss:.4f})")
-        else:
-            epochs_without_improvement += 1
+            save_checkpoint(
+                model,
+                optimizer,
+                global_step,
+                best_path,
+                epoch=display_epoch,
+                scheduler=scheduler,
+            )
             print(
-                f"No validation improvement for {epochs_without_improvement}/"
-                f"{args.early_stopping_patience} epoch(s)"
+                f"New best model: {best_path} "
+                f"(validation loss={best_validation_loss:.4f})"
             )
 
+        # The scheduler is part of the checkpointed training state and must
+        # advance exactly once after each completed epoch.
         scheduler.step()
+
+        # A resume run should not fabricate a new early-stopping history.
+        # For fresh runs, patience is based on the best score within this run.
+        if local_epoch == 0:
+            epochs_without_improvement = 0
+        elif validation_loss >= best_validation_loss:
+            epochs_without_improvement = epochs_without_improvement + 1
 
         if (
             args.early_stopping_patience > 0
+            and local_epoch > 0
             and epochs_without_improvement >= args.early_stopping_patience
         ):
             print("Early stopping triggered.")

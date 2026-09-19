@@ -6,8 +6,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from config.model_config import ModelConfig
-from data.prepare_training_data import load_token_ids
 from data.dataset import LanguageModelDataset
+from data.prepare_training_data import load_token_ids
 from evaluation.evaluate import evaluate
 from model.llm import LLM
 from training.checkpoint import load_checkpoint, save_checkpoint
@@ -45,7 +45,12 @@ def parse_args(args=None):
         "--learning-rate", type=float, default=DEFAULT_LEARNING_RATE
     )
     parser.add_argument("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY)
-    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=DEFAULT_EPOCHS,
+        help="Total target epochs, including epochs already completed by a resumed checkpoint.",
+    )
     parser.add_argument("--log-every", type=int, default=DEFAULT_LOG_EVERY)
     parser.add_argument(
         "--max-train-batches", type=int, default=DEFAULT_MAX_TRAIN_BATCHES
@@ -146,14 +151,18 @@ def main(args=None):
     )
 
     if len(train_dataset) == 0 or len(validation_dataset) == 0:
-        raise ValueError("Training and validation splits must contain complete sequences")
+        raise ValueError(
+            "Training and validation splits must contain complete sequences"
+        )
 
     loader_kwargs = {
         "batch_size": args.batch_size,
         "num_workers": args.num_workers,
     }
     train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
-    validation_loader = DataLoader(validation_dataset, shuffle=False, **loader_kwargs)
+    validation_loader = DataLoader(
+        validation_dataset, shuffle=False, **loader_kwargs
+    )
 
     print(
         f"Training sequences: {len(train_dataset):,} "
@@ -188,6 +197,8 @@ def main(args=None):
 
     start_epoch = 0
     global_step = 0
+    best_validation_loss = math.inf
+    epochs_without_improvement = 0
 
     if args.resume is not None:
         resume_state = load_checkpoint(
@@ -199,21 +210,29 @@ def main(args=None):
         )
         global_step = resume_state["step"]
         start_epoch = resume_state["epoch"]
+
+        restored_best = resume_state.get("best_validation_loss")
+        if restored_best is not None:
+            best_validation_loss = float(restored_best)
+        epochs_without_improvement = int(
+            resume_state.get("epochs_without_improvement", 0)
+        )
+
+        if start_epoch >= args.epochs:
+            print(
+                f"Checkpoint already completed {start_epoch} epoch(s); "
+                f"target is {args.epochs}. Nothing to train."
+            )
+            return
+
         print(
             f"Resumed from {args.resume} at optimizer step {global_step} "
             f"(completed epoch {start_epoch})"
         )
 
-    best_validation_loss = math.inf
     best_path = args.checkpoint_dir / "best_model.pt"
 
-    # If an existing best checkpoint is present, use its recorded metric only
-    # when it is explicitly supplied as the resume checkpoint. Fresh runs are
-    # intentionally evaluated from scratch.
-    epochs_to_run = args.epochs
-
-    for local_epoch in range(epochs_to_run):
-        display_epoch = start_epoch + local_epoch + 1
+    for display_epoch in range(start_epoch + 1, args.epochs + 1):
         model.train()
         optimizer.zero_grad(set_to_none=True)
         running_loss = 0.0
@@ -265,7 +284,7 @@ def main(args=None):
                 if global_step == 1 or global_step % args.log_every == 0:
                     average_loss = running_loss / current_accumulation
                     print(
-                        f"Epoch {display_epoch}/{start_epoch + epochs_to_run} | "
+                        f"Epoch {display_epoch}/{args.epochs} | "
                         f"Step {global_step} | Loss {average_loss:.4f} | "
                         f"LR {optimizer.param_groups[0]['lr']:.2e}"
                     )
@@ -279,9 +298,18 @@ def main(args=None):
             f"Perplexity: {metrics['perplexity']:.2f}"
         )
 
-        checkpoint_path = (
-            args.checkpoint_dir / f"model_epoch_{display_epoch}.pt"
-        )
+        improved = validation_loss < best_validation_loss
+        if improved:
+            best_validation_loss = validation_loss
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+        # Advance the scheduler before writing the checkpoint so the saved
+        # scheduler state is ready for the next epoch.
+        scheduler.step()
+
+        checkpoint_path = args.checkpoint_dir / f"model_epoch_{display_epoch}.pt"
         save_checkpoint(
             model,
             optimizer,
@@ -289,11 +317,12 @@ def main(args=None):
             checkpoint_path,
             epoch=display_epoch,
             scheduler=scheduler,
+            best_validation_loss=best_validation_loss,
+            epochs_without_improvement=epochs_without_improvement,
         )
         print(f"Checkpoint saved: {checkpoint_path}")
 
-        if validation_loss < best_validation_loss:
-            best_validation_loss = validation_loss
+        if improved:
             save_checkpoint(
                 model,
                 optimizer,
@@ -301,26 +330,22 @@ def main(args=None):
                 best_path,
                 epoch=display_epoch,
                 scheduler=scheduler,
+                best_validation_loss=best_validation_loss,
+                epochs_without_improvement=epochs_without_improvement,
             )
             print(
                 f"New best model: {best_path} "
                 f"(validation loss={best_validation_loss:.4f})"
             )
-
-        # The scheduler is part of the checkpointed training state and must
-        # advance exactly once after each completed epoch.
-        scheduler.step()
-
-        # A resume run should not fabricate a new early-stopping history.
-        # For fresh runs, patience is based on the best score within this run.
-        if local_epoch == 0:
-            epochs_without_improvement = 0
-        elif validation_loss >= best_validation_loss:
-            epochs_without_improvement = epochs_without_improvement + 1
+        else:
+            print(
+                f"No validation improvement for "
+                f"{epochs_without_improvement}/"
+                f"{args.early_stopping_patience} epoch(s)"
+            )
 
         if (
             args.early_stopping_patience > 0
-            and local_epoch > 0
             and epochs_without_improvement >= args.early_stopping_patience
         ):
             print("Early stopping triggered.")

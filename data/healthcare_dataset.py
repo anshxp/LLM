@@ -14,6 +14,32 @@ CATEGORIES = {
 }
 
 
+class RecordSplits(tuple):
+    """Tuple-compatible train/validation/test split with dict-style access."""
+
+    _KEYS = ("train", "validation", "test")
+
+    def __new__(cls, train, validation, test):
+        return super().__new__(cls, (train, validation, test))
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            try:
+                key = self._KEYS.index(key)
+            except ValueError as exc:
+                raise KeyError(key) from exc
+        return super().__getitem__(key)
+
+    def items(self):
+        return zip(self._KEYS, self)
+
+    def keys(self):
+        return self._KEYS
+
+    def values(self):
+        return iter(self)
+
+
 def load_jsonl(path):
     """Load and validate one JSONL healthcare dataset."""
     path = Path(path)
@@ -58,11 +84,11 @@ def split_records(records, validation_ratio=0.1, test_ratio=0.1):
         raise ValueError("Dataset is too small for the requested split ratios")
 
     train_end = total - validation_count - test_count
-    return {
-        "train": records[:train_end],
-        "validation": records[train_end:train_end + validation_count],
-        "test": records[train_end + validation_count:],
-    }
+    return RecordSplits(
+        records[:train_end],
+        records[train_end:train_end + validation_count],
+        records[train_end + validation_count:],
+    )
 
 
 def write_jsonl(records, path):

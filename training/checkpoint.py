@@ -11,8 +11,10 @@ def save_checkpoint(
     epoch=0,
     batch_index=0,
     scheduler=None,
+    best_validation_loss=None,
+    epochs_without_improvement=0,
 ):
-    """Save model, optimizer, scheduler, and training progress for reliable resume."""
+    """Save model and complete training state for reliable resume."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -22,6 +24,8 @@ def save_checkpoint(
         "step": step,
         "epoch": epoch,
         "batch_index": batch_index,
+        "best_validation_loss": best_validation_loss,
+        "epochs_without_improvement": epochs_without_improvement,
     }
     if scheduler is not None:
         payload["scheduler_state_dict"] = scheduler.state_dict()
@@ -36,7 +40,7 @@ def load_checkpoint(
     map_location=None,
     scheduler=None,
 ):
-    """Restore a checkpoint and return its stored training progress."""
+    """Restore a checkpoint and return its stored training state."""
     checkpoint = torch.load(
         Path(path),
         map_location=map_location,
@@ -53,4 +57,8 @@ def load_checkpoint(
         "step": checkpoint["step"],
         "epoch": checkpoint.get("epoch", 0),
         "batch_index": checkpoint.get("batch_index", 0),
+        "best_validation_loss": checkpoint.get("best_validation_loss"),
+        "epochs_without_improvement": checkpoint.get(
+            "epochs_without_improvement", 0
+        ),
     }

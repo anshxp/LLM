@@ -3,6 +3,21 @@ from pathlib import Path
 import torch
 
 
+class CheckpointState(int):
+    """Integer-compatible checkpoint state with resume metadata."""
+
+    def __new__(cls, step, **metadata):
+        instance = int.__new__(cls, step)
+        instance._metadata = {"step": step, **metadata}
+        return instance
+
+    def __getitem__(self, key):
+        return self._metadata[key]
+
+    def get(self, key, default=None):
+        return self._metadata.get(key, default)
+
+
 def save_checkpoint(
     model,
     optimizer,
@@ -40,7 +55,12 @@ def load_checkpoint(
     map_location=None,
     scheduler=None,
 ):
-    """Restore a checkpoint and return its stored training state."""
+    """Restore a checkpoint and return its stored training state.
+
+    The returned object remains integer-compatible for legacy callers that
+    compared the return value directly with the optimizer step, while also
+    exposing the full resume metadata through mapping-style access.
+    """
     checkpoint = torch.load(
         Path(path),
         map_location=map_location,
@@ -53,12 +73,12 @@ def load_checkpoint(
     if scheduler is not None and "scheduler_state_dict" in checkpoint:
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 
-    return {
-        "step": checkpoint["step"],
-        "epoch": checkpoint.get("epoch", 0),
-        "batch_index": checkpoint.get("batch_index", 0),
-        "best_validation_loss": checkpoint.get("best_validation_loss"),
-        "epochs_without_improvement": checkpoint.get(
+    return CheckpointState(
+        checkpoint["step"],
+        epoch=checkpoint.get("epoch", 0),
+        batch_index=checkpoint.get("batch_index", 0),
+        best_validation_loss=checkpoint.get("best_validation_loss"),
+        epochs_without_improvement=checkpoint.get(
             "epochs_without_improvement", 0
         ),
-    }
+    )

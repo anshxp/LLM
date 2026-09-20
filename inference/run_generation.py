@@ -15,6 +15,17 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=50)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=None)
+    parser.add_argument("--top-p", type=float, default=None)
+    parser.add_argument(
+        "--greedy",
+        action="store_true",
+        help="Use deterministic greedy decoding instead of sampling.",
+    )
+    parser.add_argument(
+        "--stop-at-eos",
+        action="store_true",
+        help="Stop generation when the tokenizer EOS token is generated.",
+    )
     parser.add_argument("--tokenizer", default="data/processed/tokenizer.json")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     args = parser.parse_args()
@@ -24,7 +35,11 @@ def main():
 
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available")
-    device = torch.device("cuda" if args.device == "cuda" or (args.device == "auto" and torch.cuda.is_available()) else "cpu")
+    device = torch.device(
+        "cuda"
+        if args.device == "cuda" or (args.device == "auto" and torch.cuda.is_available())
+        else "cpu"
+    )
 
     tokenizer = Tokenizer.from_file(args.tokenizer)
     config = ModelConfig(vocab_size=len(tokenizer))
@@ -40,6 +55,9 @@ def main():
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_k=args.top_k,
+        top_p=args.top_p,
+        do_sample=not args.greedy,
+        eos_token_id=tokenizer.token_to_id["<eos>"] if args.stop_at_eos else None,
     )
     print(tokenizer.decode(output_ids[0].tolist()))
 

@@ -8,6 +8,29 @@ from inference.generate import generate
 from model.llm import LLM
 
 
+def _validate_checkpoint_compatibility(checkpoint, config):
+    if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
+        raise ValueError("Checkpoint must contain a 'model_state_dict' entry")
+
+    state = checkpoint["model_state_dict"]
+    expected_shapes = {
+        "embedding.token_embedding.weight": (config.vocab_size, config.embedding_dim),
+        "embedding.position_embedding.weight": (config.context_length, config.embedding_dim),
+        "lm_head.weight": (config.vocab_size, config.embedding_dim),
+        "lm_head.bias": (config.vocab_size,),
+    }
+
+    for name, expected_shape in expected_shapes.items():
+        if name not in state:
+            raise ValueError(f"Checkpoint is missing required parameter: {name}")
+        actual_shape = tuple(state[name].shape)
+        if actual_shape != expected_shape:
+            raise ValueError(
+                f"Checkpoint/model mismatch for {name}: "
+                f"checkpoint shape={actual_shape}, expected={expected_shape}"
+            )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate text from a trained checkpoint.")
     parser.add_argument("--checkpoint", required=True)
@@ -43,8 +66,10 @@ def main():
 
     tokenizer = Tokenizer.from_file(args.tokenizer)
     config = ModelConfig(vocab_size=len(tokenizer))
-    model = LLM(config).to(device)
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    _validate_checkpoint_compatibility(checkpoint, config)
+
+    model = LLM(config).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
 
     prompt_ids = tokenizer.encode(args.prompt)

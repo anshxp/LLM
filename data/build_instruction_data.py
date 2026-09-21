@@ -13,6 +13,8 @@ import re
 from pathlib import Path
 
 FIELDS = ("instruction", "input", "response", "category", "source")
+EXAMPLE_FIELDS = ("instruction", "input", "response")
+OUTPUT_SPLITS = ("train.jsonl", "validation.jsonl", "test.jsonl", "manifest.json")
 
 
 def normalize(text):
@@ -25,7 +27,13 @@ def stable_id(record):
 
 
 def record_key(record):
-    return tuple(record[k] for k in ("instruction", "input", "response"))
+    """Return the semantic example key used for duplicate detection.
+
+    Source/category are deliberately excluded: the same instruction/input/response
+    must never appear twice, even if it was discovered in multiple source files or
+    assigned to different categories.
+    """
+    return tuple(record[k] for k in EXAMPLE_FIELDS)
 
 
 def make_record(instruction, source_text, response, category, source):
@@ -46,7 +54,8 @@ def make_record(instruction, source_text, response, category, source):
 
 
 def read_text_files(root):
-    for path in sorted(Path(root).rglob("*")):
+    root = Path(root)
+    for path in sorted(root.rglob("*")):
         if path.is_file() and path.suffix.lower() in {".txt", ".md"}:
             try:
                 text = path.read_text(encoding="utf-8", errors="ignore")
@@ -85,6 +94,36 @@ def explicit_qa(text):
                 yield line, answer
 
 
+def deduplicate_records(records):
+    """Canonicalize a record collection by semantic example content.
+
+    This second deduplication pass is intentional. It protects the final artifact
+    even if a future builder path bypasses ``add_record`` or introduces another
+    record-producing source. The first occurrence is retained deterministically.
+    """
+    unique = []
+    seen_examples = set()
+    seen_ids = set()
+    for record in records:
+        key = record_key(record)
+        if key in seen_examples or record["id"] in seen_ids:
+            continue
+        unique.append(record)
+        seen_examples.add(key)
+        seen_ids.add(record["id"])
+    return unique
+
+
+def validate_unique_records(records):
+    """Raise if records are not unique by training-example content or id."""
+    example_keys = [record_key(record) for record in records]
+    ids = [record["id"] for record in records]
+    if len(example_keys) != len(set(example_keys)):
+        raise ValueError("Instruction builder produced duplicate examples")
+    if len(ids) != len(set(ids)):
+        raise ValueError("Instruction builder produced duplicate record ids")
+
+
 def build_records(source_root):
     records = []
     seen_ids = set()
@@ -94,9 +133,7 @@ def build_records(source_root):
         if record is None:
             return
         example_key = record_key(record)
-        if example_key in seen_examples:
-            return
-        if record["id"] in seen_ids:
+        if example_key in seen_examples or record["id"] in seen_ids:
             return
         records.append(record)
         seen_examples.add(example_key)
@@ -133,10 +170,14 @@ def build_records(source_root):
             for instruction, category in templates:
                 add_record(make_record(instruction, passage, passage, category, source))
 
+    records = deduplicate_records(records)
+    validate_unique_records(records)
     return records
 
 
 def split(records, train_ratio=0.9, validation_ratio=0.05):
+    records = deduplicate_records(records)
+    validate_unique_records(records)
     records = sorted(records, key=lambda r: r["id"])
     n = len(records)
     train_end = int(n * train_ratio)
@@ -145,10 +186,53 @@ def split(records, train_ratio=0.9, validation_ratio=0.05):
 
 
 def write_jsonl(records, path):
+    validate_unique_records(records)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         for record in records:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def clean_output_dir(output_dir):
+    """Remove only artifacts owned by this builder before writing a new dataset."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for filename in OUTPUT_SPLITS:
+        path = output_dir / filename
+        if path.exists():
+            path.unlink()
+
+
+def verify_written_dataset(output_dir):
+    """Read all generated splits back and verify global uniqueness/disjointness."""
+    output_dir = Path(output_dir)
+    all_records = []
+    split_ids = {}
+    for split_name in ("train", "validation", "test"):
+        path = output_dir / f"{split_name}.jsonl"
+        if not path.exists():
+            raise RuntimeError(f"Missing generated split: {path}")
+        records = []
+        for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"Invalid JSON in {path}:{line_number}: {exc}") from exc
+            records.append(record)
+        validate_unique_records(records)
+        split_ids[split_name] = {record["id"] for record in records}
+        all_records.extend(records)
+
+    validate_unique_records(all_records)
+    names = tuple(split_ids)
+    for index, left in enumerate(names):
+        for right in names[index + 1 :]:
+            overlap = split_ids[left] & split_ids[right]
+            if overlap:
+                raise RuntimeError(f"Generated splits overlap: {left} and {right}")
+    return len(all_records)
 
 
 def main():
@@ -164,10 +248,18 @@ def main():
         raise RuntimeError(
             f"Only {len(records)} examples were produced; refusing to create a tiny fine-tuning set."
         )
+
+    clean_output_dir(args.output_dir)
     train, validation, test = split(records)
     write_jsonl(train, args.output_dir / "train.jsonl")
     write_jsonl(validation, args.output_dir / "validation.jsonl")
     write_jsonl(test, args.output_dir / "test.jsonl")
+
+    written_total = verify_written_dataset(args.output_dir)
+    if written_total != len(records):
+        raise RuntimeError(
+            f"Generated dataset count mismatch: built {len(records)}, wrote {written_total}"
+        )
 
     manifest = {
         "source_root": str(args.source_root),
@@ -179,6 +271,7 @@ def main():
             category: sum(r["category"] == category for r in records)
             for category in sorted({r["category"] for r in records})
         },
+        "duplicate_examples": 0,
         "provenance": "Every response is copied from the source passage or an explicit Q/A answer; no generated medical facts are introduced.",
     }
     (args.output_dir / "manifest.json").write_text(

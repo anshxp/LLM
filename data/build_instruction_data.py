@@ -65,7 +65,14 @@ def read_text_files(root):
                 yield path, text
 
 
-def paragraphs(text, min_chars=160, max_chars=1800):
+def paragraphs(text, min_chars=120, max_chars=1800):
+    """Yield usable source passages while preserving deterministic extraction.
+
+    120 characters is long enough to avoid trivial fragments while allowing concise
+    but complete source paragraphs. The previous 160-character threshold rejected
+    valid short passages and caused the duplicate-normalization regression fixture to
+    produce zero examples.
+    """
     raw = re.split(r"\n\s*\n+", text)
     for block in raw:
         block = normalize(block)

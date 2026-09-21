@@ -1,6 +1,11 @@
 import json
 
+import pytest
 import torch
+from tokenizers import Tokenizer as HFTokenizer
+from tokenizers.models import BPE
+from tokenizers.pre_tokenizers import Whitespace
+from tokenizers.trainers import BpeTrainer
 
 from data.instruction_dataset import (
     InstructionDataset,
@@ -19,6 +24,28 @@ def record(response="The heart pumps blood."):
     }
 
 
+@pytest.fixture
+def tokenizer_path(tmp_path):
+    path = tmp_path / "tokenizer.json"
+    tokenizer = HFTokenizer(BPE(unk_token="<unk>"))
+    tokenizer.pre_tokenizer = Whitespace()
+    trainer = BpeTrainer(
+        vocab_size=64,
+        special_tokens=["<pad>", "<unk>", "<bos>", "<eos>"],
+        min_frequency=1,
+    )
+    tokenizer.train_from_iterator(
+        [
+            "### Instruction: Explain the term simply.",
+            "### Input: heart",
+            "### Response: The heart pumps blood.",
+        ],
+        trainer=trainer,
+    )
+    tokenizer.save(str(path))
+    return path
+
+
 def test_format_example_has_explicit_response_boundary():
     prompt, response = format_example(record())
     assert "### Instruction:" in prompt
@@ -27,11 +54,12 @@ def test_format_example_has_explicit_response_boundary():
     assert response == "The heart pumps blood."
 
 
-def test_dataset_masks_prompt_targets(tmp_path):
-    path = tmp_path / "data.jsonl"
-    path.write_text(json.dumps(record()) + "\n", encoding="utf-8")
-
-    dataset = InstructionDataset(load_jsonl(path), context_length=128)
+def test_dataset_masks_prompt_targets(tokenizer_path):
+    dataset = InstructionDataset(
+        [record()],
+        context_length=128,
+        tokenizer_path=tokenizer_path,
+    )
     input_ids, labels = dataset[0]
 
     assert input_ids.dtype == torch.long
@@ -62,9 +90,5 @@ def test_load_jsonl_rejects_duplicates(tmp_path):
     text = json.dumps(record()) + "\n" + json.dumps(record()) + "\n"
     path.write_text(text, encoding="utf-8")
 
-    try:
+    with pytest.raises(ValueError, match="Duplicate"):
         load_jsonl(path)
-    except ValueError as exc:
-        assert "Duplicate" in str(exc)
-    else:
-        raise AssertionError("duplicate records should be rejected")

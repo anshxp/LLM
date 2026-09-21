@@ -150,3 +150,12 @@ def test_instruction_training_cli_accepts_instruction_dataset():
 
     assert args.dataset == "instruction"
     assert args.batch_size == 2
+
+def test_instruction_training_cli_uses_sft_defaults():
+    from train import DEFAULT_SFT_LEARNING_RATE, DEFAULT_SFT_LR_MIN, parse_args
+
+    args = parse_args(["--dataset", "instruction"])
+
+    assert args.learning_rate == DEFAULT_SFT_LEARNING_RATE
+    assert args.lr_min == DEFAULT_SFT_LR_MIN
+    assert str(args.pretrained_checkpoint).endswith("checkpoints\\phase7_run\\best_model.pt")

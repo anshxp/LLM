@@ -69,6 +69,20 @@ def test_dataset_masks_prompt_targets(tokenizer_path):
     assert (labels != -100).any()
 
 
+def test_dataset_truncates_long_response_to_context(tokenizer_path):
+    long_response = " ".join(["long"] * 256)
+    dataset = InstructionDataset(
+        [record(long_response)],
+        context_length=32,
+        tokenizer_path=tokenizer_path,
+    )
+    input_ids, labels = dataset[0]
+
+    assert input_ids.shape == labels.shape
+    assert input_ids.size(0) <= 32
+    assert (labels != -100).any()
+
+
 def test_collate_instruction_batch_pads_labels_with_ignore_index():
     short = (
         torch.tensor([1, 2, 3], dtype=torch.long),

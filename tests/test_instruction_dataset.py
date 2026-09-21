@@ -2,7 +2,12 @@ import json
 
 import torch
 
-from data.instruction_dataset import InstructionDataset, format_example, load_jsonl
+from data.instruction_dataset import (
+    InstructionDataset,
+    collate_instruction_batch,
+    format_example,
+    load_jsonl,
+)
 
 
 def record(response="The heart pumps blood."):
@@ -34,6 +39,22 @@ def test_dataset_masks_prompt_targets(tmp_path):
     assert input_ids.shape == labels.shape
     assert (labels == -100).any()
     assert (labels != -100).any()
+
+
+def test_collate_instruction_batch_pads_labels_with_ignore_index():
+    short = (
+        torch.tensor([1, 2, 3], dtype=torch.long),
+        torch.tensor([-100, 5, 6], dtype=torch.long),
+    )
+    long = (
+        torch.tensor([7, 8, 9, 10], dtype=torch.long),
+        torch.tensor([-100, -100, 11, 12], dtype=torch.long),
+    )
+
+    input_ids, labels = collate_instruction_batch([short, long])
+
+    assert input_ids.tolist() == [[1, 2, 3, 0], [7, 8, 9, 10]]
+    assert labels.tolist() == [[-100, 5, 6, -100], [-100, -100, 11, 12]]
 
 
 def test_load_jsonl_rejects_duplicates(tmp_path):

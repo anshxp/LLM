@@ -55,7 +55,8 @@ def parse_args(args=None):
         default=DEFAULT_GRADIENT_ACCUMULATION_STEPS,
     )
     parser.add_argument(
-        "--learning-rate", type=float, default=DEFAULT_LEARNING_RATE
+        "--learning-rate", type=float, default=None,
+        help="Learning rate. Defaults to 5e-5 for instruction SFT and 3e-4 otherwise.",
     )
     parser.add_argument("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY)
     parser.add_argument(

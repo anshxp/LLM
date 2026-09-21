@@ -1,5 +1,3 @@
-import json
-
 from data.build_instruction_data import build_records, split, stable_id
 
 
@@ -11,12 +9,13 @@ def test_stable_id_is_deterministic():
 def test_builder_emits_source_grounded_records(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
-    (source / "doc.txt").write_text(
-        """What is diabetes?\nDiabetes is a chronic metabolic condition involving elevated blood glucose levels.\n\n"
+    text = (
+        "What is diabetes?\n"
+        "Diabetes is a chronic metabolic condition involving elevated blood glucose levels.\n\n"
         "A sufficiently long medical passage explains the cardiovascular system and blood vessels in a neutral way. "
-        "The passage contains enough text to exercise the deterministic paragraph extraction path without relying on a generated answer.\n""",
-        encoding="utf-8",
+        "The passage contains enough text to exercise the deterministic paragraph extraction path without relying on a generated answer.\n"
     )
+    (source / "doc.txt").write_text(text, encoding="utf-8")
     records = build_records(source)
     assert records
     assert all(r["source"] == "doc.txt" for r in records)

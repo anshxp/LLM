@@ -24,21 +24,25 @@ def stable_id(record):
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
+def record_key(record):
+    return tuple(record[k] for k in ("instruction", "input", "response"))
+
+
 def make_record(instruction, source_text, response, category, source):
     source_text = normalize(source_text)
     response = normalize(response)
     instruction = normalize(instruction)
     if not instruction or not source_text or not response:
         return None
-    return {
+    record = {
         "instruction": instruction,
         "input": source_text,
         "response": response,
         "category": category,
         "source": source,
-        "id": stable_id({"instruction": instruction, "input": source_text,
-                         "response": response, "category": category, "source": source}),
     }
+    record["id"] = stable_id(record)
+    return record
 
 
 def read_text_files(root):
@@ -83,30 +87,52 @@ def explicit_qa(text):
 
 def build_records(source_root):
     records = []
-    seen = set()
+    seen_ids = set()
+    seen_examples = set()
+
+    def add_record(record):
+        if record is None:
+            return
+        example_key = record_key(record)
+        if example_key in seen_examples:
+            return
+        if record["id"] in seen_ids:
+            return
+        records.append(record)
+        seen_examples.add(example_key)
+        seen_ids.add(record["id"])
+
     for path, text in read_text_files(source_root):
         source = str(path.relative_to(source_root)).replace("\\", "/")
         for question, answer in explicit_qa(text):
-            record = make_record(
-                "Answer the question using only the provided source text.",
-                f"Question: {question}\nSource answer: {answer}",
-                answer,
-                "source_qa",
-                source,
+            add_record(
+                make_record(
+                    "Answer the question using only the provided source text.",
+                    f"Question: {question}\nSource answer: {answer}",
+                    answer,
+                    "source_qa",
+                    source,
+                )
             )
-            if record and record["id"] not in seen:
-                records.append(record); seen.add(record["id"])
 
+        templates = [
+            (
+                "Extract the key information from the following medical passage.",
+                "grounded_extraction",
+            ),
+            (
+                "Explain the following passage without adding information not present in it.",
+                "grounded_explanation",
+            ),
+            (
+                "Provide the relevant source text for this request without inventing facts.",
+                "grounded_response",
+            ),
+        ]
         for passage in paragraphs(text):
-            templates = [
-                ("Extract the key information from the following medical passage.", "grounded_extraction"),
-                ("Explain the following passage without adding information not present in it.", "grounded_explanation"),
-                ("Provide the relevant source text for this request without inventing facts.", "grounded_response"),
-            ]
             for instruction, category in templates:
-                record = make_record(instruction, passage, passage, category, source)
-                if record and record["id"] not in seen:
-                    records.append(record); seen.add(record["id"])
+                add_record(make_record(instruction, passage, passage, category, source))
+
     return records
 
 
@@ -126,14 +152,18 @@ def write_jsonl(records, path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Build source-grounded instruction JSONL from LLM-Data.")
+    parser = argparse.ArgumentParser(
+        description="Build source-grounded instruction JSONL from LLM-Data."
+    )
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=Path("data/instruction"))
     args = parser.parse_args()
 
     records = build_records(args.source_root)
     if len(records) < 100:
-        raise RuntimeError(f"Only {len(records)} examples were produced; refusing to create a tiny fine-tuning set.")
+        raise RuntimeError(
+            f"Only {len(records)} examples were produced; refusing to create a tiny fine-tuning set."
+        )
     train, validation, test = split(records)
     write_jsonl(train, args.output_dir / "train.jsonl")
     write_jsonl(validation, args.output_dir / "validation.jsonl")
@@ -145,10 +175,15 @@ def main():
         "train": len(train),
         "validation": len(validation),
         "test": len(test),
-        "categories": {category: sum(r["category"] == category for r in records) for category in sorted({r["category"] for r in records})},
+        "categories": {
+            category: sum(r["category"] == category for r in records)
+            for category in sorted({r["category"] for r in records})
+        },
         "provenance": "Every response is copied from the source passage or an explicit Q/A answer; no generated medical facts are introduced.",
     }
-    (args.output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    (args.output_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8"
+    )
     print(json.dumps(manifest, indent=2))
 
 

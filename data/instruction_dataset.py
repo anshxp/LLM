@@ -92,3 +92,27 @@ class InstructionDataset(Dataset):
 
     def __getitem__(self, index):
         return self.examples[index]
+
+
+def collate_instruction_batch(batch):
+    """Pad variable-length instruction examples for batched training.
+
+    Input padding uses token id 0. Label padding uses -100 so padded positions
+    are ignored by cross-entropy. Because padding is appended after each example,
+    it cannot leak information into later non-padding response tokens.
+    """
+    if not batch:
+        raise ValueError("Cannot collate an empty instruction batch")
+
+    max_length = max(inputs.size(0) for inputs, _ in batch)
+    input_ids = torch.zeros((len(batch), max_length), dtype=torch.long)
+    target_ids = torch.full(
+        (len(batch), max_length), -100, dtype=torch.long
+    )
+
+    for index, (inputs, labels) in enumerate(batch):
+        length = inputs.size(0)
+        input_ids[index, :length] = inputs
+        target_ids[index, :length] = labels
+
+    return input_ids, target_ids

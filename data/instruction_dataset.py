@@ -67,17 +67,24 @@ class InstructionDataset(Dataset):
         prompt, response = format_example(record)
         prompt_ids = self.tokenizer.encode(prompt, add_bos=True)
         response_ids = self.tokenizer.encode(response, add_eos=True)
+        max_tokens = self.context_length + 1
+        if max_tokens < 2:
+            raise ValueError("context_length must be at least 1")
+        if not response_ids:
+            raise ValueError("Instruction response must contain at least one token")
+
+        # Preserve the response when possible. If the response itself is longer
+        # than context, retain its newest tokens and keep EOS as the final token.
+        if len(response_ids) >= max_tokens:
+            response_ids = response_ids[-max_tokens:]
+            prompt_ids = []
+        else:
+            max_prompt = max_tokens - len(response_ids)
+            prompt_ids = prompt_ids[-max_prompt:]
         token_ids = prompt_ids + response_ids
 
         if len(token_ids) < 2:
             raise ValueError("Instruction example must contain at least two tokens")
-        if len(token_ids) > self.context_length + 1:
-            # Preserve the response and truncate the oldest prompt tokens first.
-            max_prompt = max(0, self.context_length + 1 - len(response_ids))
-            prompt_ids = prompt_ids[-max_prompt:] if max_prompt else []
-            token_ids = prompt_ids + response_ids
-        if len(token_ids) > self.context_length + 1:
-            raise ValueError("Response is longer than the model context length")
 
         inputs = torch.tensor(token_ids[:-1], dtype=torch.long)
         labels = torch.tensor(token_ids[1:], dtype=torch.long)

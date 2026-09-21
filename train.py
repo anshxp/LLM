@@ -7,6 +7,11 @@ from torch.utils.data import DataLoader
 
 from config.model_config import ModelConfig
 from data.dataset import LanguageModelDataset
+from data.instruction_dataset import (
+    InstructionDataset,
+    collate_instruction_batch,
+    load_jsonl,
+)
 from data.prepare_training_data import load_token_ids
 from evaluation.evaluate import evaluate
 from model.llm import LLM
@@ -28,13 +33,18 @@ DEFAULT_TRAIN_STRIDE = 128
 DEFAULT_EVAL_STRIDE = 256
 DEFAULT_LR_MIN = 3e-5
 DEFAULT_EARLY_STOPPING_PATIENCE = 2
+DEFAULT_INSTRUCTION_DIR = Path("data/instruction")
 
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser(
         description="Train the healthcare-focused language model."
     )
-    parser.add_argument("--dataset", choices=("base", "healthcare"), default="base")
+    parser.add_argument(
+        "--dataset",
+        choices=("base", "healthcare", "instruction"),
+        default="base",
+    )
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument(
         "--gradient-accumulation-steps",
@@ -74,6 +84,12 @@ def parse_args(args=None):
         "--early-stopping-patience",
         type=int,
         default=DEFAULT_EARLY_STOPPING_PATIENCE,
+    )
+    parser.add_argument(
+        "--instruction-dir",
+        type=Path,
+        default=DEFAULT_INSTRUCTION_DIR,
+        help="Directory containing instruction train/validation/test JSONL files.",
     )
     return parser.parse_args(args)
 
@@ -117,13 +133,30 @@ def validate_args(args):
         raise ValueError("early_stopping_patience must be non-negative")
 
 
-def build_dataset(split, dataset_name, context_length, stride):
+def build_dataset(split, dataset_name, context_length, stride, instruction_dir=None):
+    if dataset_name == "instruction":
+        if instruction_dir is None:
+            instruction_dir = DEFAULT_INSTRUCTION_DIR
+        records = load_jsonl(Path(instruction_dir) / f"{split}.jsonl")
+        return InstructionDataset(records, context_length=context_length)
+
     token_ids = load_token_ids(split, dataset=dataset_name)
     return LanguageModelDataset(
         token_ids=token_ids,
         context_length=context_length,
         stride=stride,
     )
+
+
+def make_loader(dataset, dataset_name, batch_size, shuffle, num_workers):
+    kwargs = {
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": num_workers,
+    }
+    if dataset_name == "instruction":
+        kwargs["collate_fn"] = collate_instruction_batch
+    return DataLoader(dataset, **kwargs)
 
 
 def main(args=None):
@@ -142,12 +175,14 @@ def main(args=None):
         args.dataset,
         config.context_length,
         args.train_stride,
+        instruction_dir=args.instruction_dir,
     )
     validation_dataset = build_dataset(
         "validation",
         args.dataset,
         config.context_length,
         args.eval_stride,
+        instruction_dir=args.instruction_dir,
     )
 
     if len(train_dataset) == 0 or len(validation_dataset) == 0:
@@ -155,22 +190,30 @@ def main(args=None):
             "Training and validation splits must contain complete sequences"
         )
 
-    loader_kwargs = {
-        "batch_size": args.batch_size,
-        "num_workers": args.num_workers,
-    }
-    train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
-    validation_loader = DataLoader(
-        validation_dataset, shuffle=False, **loader_kwargs
+    train_loader = make_loader(
+        train_dataset,
+        args.dataset,
+        args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+    )
+    validation_loader = make_loader(
+        validation_dataset,
+        args.dataset,
+        args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
     )
 
     print(
-        f"Training sequences: {len(train_dataset):,} "
-        f"(stride={args.train_stride})"
+        f"Training examples: {len(train_dataset):,}"
+        if args.dataset == "instruction"
+        else f"Training sequences: {len(train_dataset):,} (stride={args.train_stride})"
     )
     print(
-        f"Validation sequences: {len(validation_dataset):,} "
-        f"(stride={args.eval_stride})"
+        f"Validation examples: {len(validation_dataset):,}"
+        if args.dataset == "instruction"
+        else f"Validation sequences: {len(validation_dataset):,} (stride={args.eval_stride})"
     )
     print(f"Device: {device}")
     print(
@@ -305,8 +348,6 @@ def main(args=None):
         else:
             epochs_without_improvement += 1
 
-        # Advance the scheduler before writing the checkpoint so the saved
-        # scheduler state is ready for the next epoch.
         scheduler.step()
 
         checkpoint_path = args.checkpoint_dir / f"model_epoch_{display_epoch}.pt"
@@ -352,6 +393,27 @@ def main(args=None):
             break
 
     print(f"Training complete. Best validation loss: {best_validation_loss:.4f}")
+
+    if args.dataset == "instruction":
+        test_dataset = build_dataset(
+            "test",
+            args.dataset,
+            config.context_length,
+            args.eval_stride,
+            instruction_dir=args.instruction_dir,
+        )
+        test_loader = make_loader(
+            test_dataset,
+            args.dataset,
+            args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+        )
+        test_metrics = evaluate(model, test_loader, device=device)
+        print(
+            f"Instruction test loss: {test_metrics['loss']:.4f} | "
+            f"Perplexity: {test_metrics['perplexity']:.2f}"
+        )
 
 
 if __name__ == "__main__":

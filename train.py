@@ -34,6 +34,9 @@ DEFAULT_EVAL_STRIDE = 256
 DEFAULT_LR_MIN = 3e-5
 DEFAULT_EARLY_STOPPING_PATIENCE = 2
 DEFAULT_INSTRUCTION_DIR = Path("data/instruction")
+DEFAULT_SFT_LEARNING_RATE = 5e-5
+DEFAULT_SFT_LR_MIN = 5e-6
+DEFAULT_PRETRAIN_CHECKPOINT = Path("checkpoints/phase7_run/best_model.pt")
 
 
 def parse_args(args=None):
@@ -79,11 +82,17 @@ def parse_args(args=None):
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train-stride", type=int, default=DEFAULT_TRAIN_STRIDE)
     parser.add_argument("--eval-stride", type=int, default=DEFAULT_EVAL_STRIDE)
-    parser.add_argument("--lr-min", type=float, default=DEFAULT_LR_MIN)
+    parser.add_argument("--lr-min", type=float, default=None)
     parser.add_argument(
         "--early-stopping-patience",
         type=int,
         default=DEFAULT_EARLY_STOPPING_PATIENCE,
+    )
+    parser.add_argument(
+        "--pretrained-checkpoint",
+        type=Path,
+        default=None,
+        help="Optional pretrained checkpoint to initialize before instruction training.",
     )
     parser.add_argument(
         "--instruction-dir",
@@ -91,7 +100,20 @@ def parse_args(args=None):
         default=DEFAULT_INSTRUCTION_DIR,
         help="Directory containing instruction train/validation/test JSONL files.",
     )
-    return parser.parse_args(args)
+    parsed = parser.parse_args(args)
+    if parsed.learning_rate is None:
+        parsed.learning_rate = (
+            DEFAULT_SFT_LEARNING_RATE if parsed.dataset == "instruction"
+            else DEFAULT_LEARNING_RATE
+        )
+    if parsed.lr_min is None:
+        parsed.lr_min = (
+            DEFAULT_SFT_LR_MIN if parsed.dataset == "instruction"
+            else DEFAULT_LR_MIN
+        )
+    if parsed.dataset == "instruction" and parsed.pretrained_checkpoint is None:
+        parsed.pretrained_checkpoint = DEFAULT_PRETRAIN_CHECKPOINT
+    return parsed
 
 
 def resolve_device(requested):
@@ -242,6 +264,27 @@ def main(args=None):
     global_step = 0
     best_validation_loss = math.inf
     epochs_without_improvement = 0
+
+    if args.pretrained_checkpoint is not None and args.resume is not None:
+        raise ValueError("Use either --pretrained-checkpoint or --resume, not both")
+
+    if args.pretrained_checkpoint is not None:
+        if not args.pretrained_checkpoint.exists():
+            raise FileNotFoundError(
+                f"Pretrained checkpoint not found: {args.pretrained_checkpoint}"
+            )
+        checkpoint = torch.load(
+            args.pretrained_checkpoint,
+            map_location=device,
+            weights_only=False,
+        )
+        state_dict = checkpoint.get("model_state_dict", checkpoint.get("model"))
+        if state_dict is None:
+            raise ValueError(
+                "Pretrained checkpoint does not contain model_state_dict or model"
+            )
+        model.load_state_dict(state_dict)
+        print(f"Loaded pretrained model weights from {args.pretrained_checkpoint}")
 
     if args.resume is not None:
         resume_state = load_checkpoint(

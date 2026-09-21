@@ -141,3 +141,12 @@ def test_legacy_checkpoint_remains_loadable(tmp_path):
     assert state["epoch"] == 2
     assert state["best_validation_loss"] is None
     assert state["epochs_without_improvement"] == 0
+
+
+def test_instruction_training_cli_accepts_instruction_dataset():
+    from train import parse_args
+
+    args = parse_args(["--dataset", "instruction", "--batch-size", "2"])
+
+    assert args.dataset == "instruction"
+    assert args.batch_size == 2

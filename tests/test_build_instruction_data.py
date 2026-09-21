@@ -23,6 +23,22 @@ def test_builder_emits_source_grounded_records(tmp_path):
     assert all("id" in r for r in records)
 
 
+def test_builder_removes_duplicate_examples_after_normalization(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    passage = (
+        "This long medical passage explains blood pressure and cardiovascular health "
+        "in neutral language and contains enough information for deterministic extraction."
+    )
+    text = f"{passage}\n\n{passage}  \n"
+    (source / "doc.txt").write_text(text, encoding="utf-8")
+
+    records = build_records(source)
+    keys = [(r["instruction"], r["input"], r["response"]) for r in records]
+    assert len(keys) == len(set(keys))
+    assert len(records) == 3
+
+
 def test_split_is_deterministic_and_disjoint(tmp_path):
     source = tmp_path / "source"
     source.mkdir()

@@ -3,3 +3,5 @@ pytest
 numpy
 pymupdf
 tokenizers
+fastapi
+uvicorn[standard]

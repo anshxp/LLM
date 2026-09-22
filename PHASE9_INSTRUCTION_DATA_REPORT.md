@@ -2,41 +2,55 @@
 
 ## Objective
 
-Improve the model's instruction-following behavior without replacing the existing pretraining corpus or pretending that the corpus contains supervised question-answer pairs that it does not contain.
+Improve the model's instruction-following behavior without replacing the existing pretraining corpus or pretending that arbitrary source prose is supervised question-answer data.
 
-## Repository state reviewed
+## Current design
 
-The model repository already contains `data/instruction_dataset.py` and `train_instruction.py`. The dataset class formats records as `### Instruction / ### Input / ### Response` and applies loss only to response targets. The fine-tuning entry point loads a Phase 7 checkpoint and overrides its optimizer learning rate with the requested fine-tuning rate.
+`data/build_instruction_data.py` remains deterministic and auditable. It reads source text, extracts explicit question/answer structures, loads the curated healthcare examples, preserves provenance, deduplicates examples, and creates deterministic 90/5/5 splits.
 
-The companion `LLM-Data` repository contains the corpus-building and healthcare-data utilities, including corpus ingestion/cleaning/deduplication code and a small `healthcare_examples.jsonl` file.
+The builder still retains conservative passage-copy records (`grounded_extraction`, `grounded_explanation`, and `grounded_response`) in the generated artifact. These records are useful for provenance and future experiments, but they are not treated as default SFT supervision.
 
-## What was added
+Explicit source Q/A records are now represented as:
 
-`data/build_instruction_data.py` is a deterministic, source-grounded builder. It:
+- instruction: a request to answer using the source
+- input: the question only
+- response: the source answer
 
-1. Reads `.txt` and `.md` files from a supplied `LLM-Data` checkout.
-2. Extracts explicit question/answer structures when a question line is immediately followed by an answer line.
-3. Extracts sufficiently long source paragraphs.
-4. Creates three conservative instruction styles around those passages: grounded extraction, grounded explanation, and grounded response.
-5. Copies the source passage into the response rather than generating medical claims.
-6. Stores source-file provenance and a deterministic record ID.
-7. Sorts by ID and creates deterministic 90/5/5 train/validation/test splits.
-8. Refuses to emit a tiny dataset when fewer than 100 examples are produced.
-9. Writes `train.jsonl`, `validation.jsonl`, `test.jsonl`, and `manifest.json`.
+The previous format placed `Source answer: ...` in the input, which made the task partly self-copying and weakened the question-to-answer training signal.
 
-`tests/test_build_instruction_data.py` verifies deterministic IDs, source provenance, non-empty records, and disjoint deterministic splits.
+The curated `data/healthcare_examples.jsonl` records are also loaded into the generated instruction artifact. These contain distinct instruction/input/response targets rather than copying the entire input into the response.
 
-## Important limitation
+## SFT filtering
 
-This pipeline does **not** create high-quality semantic question-answer pairs from arbitrary medical prose. It deliberately avoids hallucinating answers. Consequently, it should be treated as an instruction-formatting and provenance layer, not as the final source of supervised medical QA.
+`data/instruction_dataset.py` now defines a supervised category allowlist:
 
-The existing eight-example instruction set is too small for meaningful fine-tuning. Expanding it by copying arbitrary passages into responses can improve response-format conditioning, but it is unlikely by itself to solve the model's current semantic-generation problem. The model's observed outputs show domain mixing, repetition, and weak question answering; those problems require better supervised targets, not merely more copies of the pretraining corpus.
+- `health_information`
+- `simplification`
+- `source_qa`
+- `summarization`
+- `terminology`
 
-## Recommended next step
+Passage-copy categories are excluded by default during instruction training.
 
-Use this pipeline to establish an auditable baseline, then add a reviewed teacher-generated or human-authored QA layer derived from the same source documents. Each generated answer should retain its source document and passage IDs, undergo schema/length/deduplication checks, and be held out by source document where possible to reduce leakage.
+`train.py` exposes this through `--instruction-categories`, while retaining the supervised-only default. This makes the training objective explicit and allows controlled experiments with other categories without changing the generated artifact.
 
-Only after that should `train_instruction.py` be run against the Phase 7 `best_model.pt` checkpoint. Compare base versus instruction-tuned checkpoints on the existing Phase 8 generation suite and held-out source-grounded QA tests.
+## Why this change matters
+
+The earlier SFT dataset contained many examples where `input == response`. Training on large numbers of these records rewards the model for reproducing source passages rather than learning the behavior needed for a user question followed by a concise answer. The change separates provenance/audit data from the examples used to optimize the instruction-following objective.
+
+This does not claim that the resulting dataset is sufficient for high-quality medical QA. The curated set is intentionally small and the explicit source-QA extraction is conservative. The change is an objective correction, not a substitute for a larger reviewed QA corpus.
+
+## Validation requirements
+
+Before a full SFT run:
+
+1. Rebuild `data/instruction` from the source corpus.
+2. Verify generated JSONL loads without duplicates.
+3. Run the full pytest suite.
+4. Run a short CPU SFT smoke test.
+5. Compare the resulting checkpoint against the previous SFT checkpoint using held-out generation prompts.
+
+A successful training loss alone is not evidence of medical answer quality. The real-checkpoint inference test should remain part of the validation process.
 
 ## Safety boundary
 

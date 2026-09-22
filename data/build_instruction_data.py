@@ -1,10 +1,12 @@
 """Build auditable instruction-tuning JSONL from the existing LLM-Data corpus.
 
 The builder separates genuinely supervised examples from passage-copy examples. Explicit
-source Q/A records and the curated healthcare examples are suitable for SFT because the
-response is a distinct answer. Extractive passage transformations remain available for
-auditing, but training code can exclude them by category so SFT does not teach the model
-to echo an entire input passage.
+source Q/A records and curated healthcare examples are suitable for SFT because the response
+is a distinct answer. Passage-copy transformations remain available for auditing, but are
+excluded from the default supervised splits.
+
+Supervised splits are built independently from passage-copy artifacts so tiny QA sets are not
+diluted or accidentally excluded by a global split.
 """
 
 import argparse
@@ -17,6 +19,7 @@ FIELDS = ("instruction", "input", "response", "category", "source")
 EXAMPLE_FIELDS = ("instruction", "input", "response")
 OUTPUT_SPLITS = ("train.jsonl", "validation.jsonl", "test.jsonl", "manifest.json")
 CURATED_CATEGORIES = {"terminology", "simplification", "summarization", "health_information"}
+SFT_CATEGORIES = frozenset((*CURATED_CATEGORIES, "source_qa"))
 
 
 def normalize(text):
@@ -33,9 +36,9 @@ def record_key(record):
 
 
 def make_record(instruction, source_text, response, category, source):
+    instruction = normalize(instruction)
     source_text = normalize(source_text)
     response = normalize(response)
-    instruction = normalize(instruction)
     if not instruction or not source_text or not response:
         return None
     record = {
@@ -83,15 +86,14 @@ def paragraphs(text, min_chars=120, max_chars=1800):
 
 def explicit_qa(text):
     lines = [normalize(x) for x in text.splitlines() if normalize(x)]
-    for i, line in enumerate(lines[:-1]):
-        if line.endswith("?") and len(line) >= 10:
-            answer = lines[i + 1]
+    for index, question in enumerate(lines[:-1]):
+        if question.endswith("?") and len(question) >= 10:
+            answer = lines[index + 1]
             if len(answer) >= 40:
-                yield line, answer
+                yield question, answer
 
 
 def curated_examples(source_root):
-    """Load the small human-authored healthcare set when present."""
     path = Path(source_root) / "healthcare_examples.jsonl"
     if not path.exists():
         return []
@@ -133,9 +135,9 @@ def deduplicate_records(records):
 
 
 def validate_unique_records(records):
-    example_keys = [record_key(record) for record in records]
+    keys = [record_key(record) for record in records]
     ids = [record["id"] for record in records]
-    if len(example_keys) != len(set(example_keys)):
+    if len(keys) != len(set(keys)):
         raise ValueError("Instruction builder produced duplicate examples")
     if len(ids) != len(set(ids)):
         raise ValueError("Instruction builder produced duplicate record ids")
@@ -159,8 +161,6 @@ def build_records(source_root):
     for path, text in read_text_files(source_root):
         source = str(path.relative_to(source_root)).replace("\\", "/")
         for question, answer in explicit_qa(text):
-            # Do not put the source answer into the model input. That creates a
-            # trivial copy task instead of question -> answer supervision.
             add_record(
                 make_record(
                     "Answer the question using only the provided source text.",
@@ -171,31 +171,40 @@ def build_records(source_root):
                 )
             )
 
-        # Keep passage-copy examples in the artifact for provenance/auditing. They
-        # are intentionally filtered out of SFT by InstructionDataset's default
-        # supervised category set.
-        templates = [
+    passage_records = list(records)
+    for path, text in read_text_files(source_root):
+        source = str(path.relative_to(source_root)).replace("\\", "/")
+        templates = (
             ("Extract the key information from the following medical passage.", "grounded_extraction"),
             ("Explain the following passage without adding information not present in it.", "grounded_explanation"),
             ("Provide the relevant source text for this request without inventing facts.", "grounded_response"),
-        ]
+        )
         for passage in paragraphs(text):
             for instruction, category in templates:
-                add_record(make_record(instruction, passage, passage, category, source))
+                record = make_record(instruction, passage, passage, category, source)
+                if record is not None:
+                    passage_records.append(record)
 
-    records = deduplicate_records(records)
-    validate_unique_records(records)
-    return records
+    return deduplicate_records(records), deduplicate_records(passage_records)
 
 
 def split(records, train_ratio=0.9, validation_ratio=0.05):
     records = deduplicate_records(records)
     validate_unique_records(records)
-    records = sorted(records, key=lambda r: r["id"])
+    records = sorted(records, key=lambda record: record["id"])
     n = len(records)
-    train_end = int(n * train_ratio)
-    val_end = train_end + int(n * validation_ratio)
-    return records[:train_end], records[train_end:val_end], records[val_end:]
+    if n < 3:
+        raise ValueError("At least 3 records are required to create train/validation/test splits.")
+    train_count = max(1, int(n * train_ratio))
+    validation_count = max(1, int(n * validation_ratio))
+    if train_count + validation_count >= n:
+        validation_count = 1
+        train_count = n - 2
+    return (
+        records[:train_count],
+        records[train_count:train_count + validation_count],
+        records[train_count + validation_count:],
+    )
 
 
 def write_jsonl(records, path):
@@ -235,11 +244,10 @@ def verify_written_dataset(output_dir):
         validate_unique_records(records)
         split_ids[split_name] = {record["id"] for record in records}
         all_records.extend(records)
-
     validate_unique_records(all_records)
     names = tuple(split_ids)
     for index, left in enumerate(names):
-        for right in names[index + 1 :]:
+        for right in names[index + 1:]:
             if split_ids[left] & split_ids[right]:
                 raise RuntimeError(f"Generated splits overlap: {left} and {right}")
     return len(all_records)
@@ -249,32 +257,45 @@ def main():
     parser = argparse.ArgumentParser(description="Build auditable instruction JSONL from LLM-Data.")
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=Path("data/instruction"))
+    parser.add_argument("--min-supervised-examples", type=int, default=100)
     args = parser.parse_args()
 
-    records = build_records(args.source_root)
-    if len(records) < 100:
-        raise RuntimeError(f"Only {len(records)} examples were produced; refusing to create a tiny fine-tuning set.")
+    supervised_records, passage_records = build_records(args.source_root)
+    if len(supervised_records) < args.min_supervised_examples:
+        raise RuntimeError(
+            f"Only {len(supervised_records)} supervised examples were produced; "
+            f"need at least {args.min_supervised_examples}. Add reviewed/generated QA before SFT."
+        )
 
     clean_output_dir(args.output_dir)
-    train, validation, test = split(records)
+    train, validation, test = split(supervised_records)
     write_jsonl(train, args.output_dir / "train.jsonl")
     write_jsonl(validation, args.output_dir / "validation.jsonl")
     write_jsonl(test, args.output_dir / "test.jsonl")
 
     written_total = verify_written_dataset(args.output_dir)
-    if written_total != len(records):
-        raise RuntimeError(f"Generated dataset count mismatch: built {len(records)}, wrote {written_total}")
+    if written_total != len(supervised_records):
+        raise RuntimeError(
+            f"Generated supervised dataset count mismatch: built {len(supervised_records)}, wrote {written_total}"
+        )
 
     manifest = {
         "source_root": str(args.source_root),
-        "total": len(records),
+        "supervised_total": len(supervised_records),
         "train": len(train),
         "validation": len(validation),
         "test": len(test),
-        "categories": {category: sum(r["category"] == category for r in records) for category in sorted({r["category"] for r in records})},
-        "sft_categories": ["health_information", "simplification", "source_qa", "summarization", "terminology"],
+        "supervised_categories": {
+            category: sum(record["category"] == category for record in supervised_records)
+            for category in sorted({record["category"] for record in supervised_records})
+        },
+        "passage_copy_total": max(0, len(passage_records) - len(supervised_records)),
+        "sft_categories": sorted(SFT_CATEGORIES),
         "duplicate_examples": 0,
-        "provenance": "Responses are copied from explicit source answers or curated healthcare examples; passage-copy records are retained for provenance but excluded from default SFT.",
+        "provenance": (
+            "SFT records come only from curated healthcare examples or explicit source Q/A. "
+            "Passage-copy records are excluded from the supervised artifact."
+        ),
     }
     (args.output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print(json.dumps(manifest, indent=2))

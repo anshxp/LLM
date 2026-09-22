@@ -50,7 +50,6 @@ def test_builder_separates_supervised_and_passage_copy_records(tmp_path):
     assert any(r["category"] == "source_qa" for r in supervised)
     assert any(r["category"] == "grounded_explanation" for r in all_records)
     assert len(all_records) > len(supervised)
-    assert len(all_records) > len(supervised)
 
 
 def test_split_is_deterministic_and_disjoint():

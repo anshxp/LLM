@@ -12,7 +12,7 @@ from data.tokenizer import Tokenizer
 
 DEFAULT_TOKENIZER = Path("data/processed/tokenizer.json")
 DEFAULT_SFT_CATEGORIES = frozenset(
-    {"terminology", "simplification", "summarization", "health_information", "source_qa"}
+    {"terminology", "simplification", "summarization", "health_information", "source_qa", "medquad_qa"}
 )
 
 

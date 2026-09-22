@@ -1,8 +1,8 @@
 """Build deterministic supervised and audit instruction datasets.
 
-The supervised dataset contains only curated healthcare examples and explicit source Q/A.
-Passage-copy examples are returned separately as an audit corpus and are never written into
-the default SFT dataset.
+The supervised dataset contains curated healthcare examples, explicit source Q/A,
+and answer-bearing MedQuAD Q/A pairs. Passage-copy examples are returned
+separately as an audit corpus and are never written into the default SFT dataset.
 """
 
 import argparse
@@ -11,8 +11,10 @@ import json
 import re
 from pathlib import Path
 
+from data.medquad import iter_medquad_records
+
 SFT_CATEGORIES = frozenset(
-    {"health_information", "simplification", "source_qa", "summarization", "terminology"}
+    {"health_information", "simplification", "source_qa", "summarization", "terminology", "medquad_qa"}
 )
 PASSAGE_CATEGORIES = (
     ("grounded_extraction", "Extract the key information from the following medical passage."),
@@ -162,6 +164,7 @@ def build_records(source_root):
         supervised_keys.add(key)
         supervised_ids.add(record["id"])
 
+    # Existing explicit Q/A text sources.
     for path, text in read_text_files(source_root):
         if path.name == CURATED_FILENAME:
             continue
@@ -177,8 +180,20 @@ def build_records(source_root):
                 )
             )
 
-    # The audit corpus is deliberately built after source Q/A discovery so it contains
-    # every supervised record, including Q/A records that were not in the initial curated set.
+    # MedQuAD is already supervised Q/A data, so its answer text belongs in SFT.
+    for question, answer, source in iter_medquad_records(source_root):
+        add_supervised(
+            make_record(
+                "Answer the medical question using the provided biomedical source answer.",
+                question,
+                answer,
+                "medquad_qa",
+                source,
+            )
+        )
+
+    # The audit corpus contains every supervised record plus passage-copy records.
+    # Passage copies are deliberately excluded from the written SFT artifact.
     audit = list(supervised)
     for path, text in read_text_files(source_root):
         if path.name == CURATED_FILENAME:
@@ -285,7 +300,7 @@ def main():
         "passage_copy_total": sum(record["category"] not in SFT_CATEGORIES for record in audit),
         "sft_categories": sorted(SFT_CATEGORIES),
         "duplicate_examples": 0,
-        "provenance": "SFT records come only from curated healthcare examples or explicit source Q/A. Passage-copy records are retained only in the in-memory audit corpus.",
+        "provenance": "SFT records come from curated healthcare examples, explicit source Q/A, or answer-bearing MedQuAD Q/A. Passage-copy records are retained only in the in-memory audit corpus.",
     }
     (args.output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print(json.dumps(manifest, indent=2))

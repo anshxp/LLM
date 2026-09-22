@@ -1,9 +1,10 @@
 """Build auditable instruction-tuning JSONL from the existing LLM-Data corpus.
 
-This builder is intentionally extractive. It never invents medical facts: responses are
-copied from source passages, or from explicit question/answer structures already present
-in the source. Use a teacher model or human review later if genuinely generated QA is
-required.
+The builder separates genuinely supervised examples from passage-copy examples. Explicit
+source Q/A records and the curated healthcare examples are suitable for SFT because the
+response is a distinct answer. Extractive passage transformations remain available for
+auditing, but training code can exclude them by category so SFT does not teach the model
+to echo an entire input passage.
 """
 
 import argparse
@@ -15,6 +16,7 @@ from pathlib import Path
 FIELDS = ("instruction", "input", "response", "category", "source")
 EXAMPLE_FIELDS = ("instruction", "input", "response")
 OUTPUT_SPLITS = ("train.jsonl", "validation.jsonl", "test.jsonl", "manifest.json")
+CURATED_CATEGORIES = {"terminology", "simplification", "summarization", "health_information"}
 
 
 def normalize(text):
@@ -27,12 +29,6 @@ def stable_id(record):
 
 
 def record_key(record):
-    """Return the semantic example key used for duplicate detection.
-
-    Source/category are deliberately excluded: the same instruction/input/response
-    must never appear twice, even if it was discovered in multiple source files or
-    assigned to different categories.
-    """
     return tuple(record[k] for k in EXAMPLE_FIELDS)
 
 
@@ -66,13 +62,6 @@ def read_text_files(root):
 
 
 def paragraphs(text, min_chars=120, max_chars=1800):
-    """Yield usable source passages while preserving deterministic extraction.
-
-    120 characters is long enough to avoid trivial fragments while allowing concise
-    but complete source paragraphs. The previous 160-character threshold rejected
-    valid short passages and caused the duplicate-normalization regression fixture to
-    produce zero examples.
-    """
     raw = re.split(r"\n\s*\n+", text)
     for block in raw:
         block = normalize(block)
@@ -101,13 +90,35 @@ def explicit_qa(text):
                 yield line, answer
 
 
-def deduplicate_records(records):
-    """Canonicalize a record collection by semantic example content.
+def curated_examples(source_root):
+    """Load the small human-authored healthcare set when present."""
+    path = Path(source_root) / "healthcare_examples.jsonl"
+    if not path.exists():
+        return []
+    records = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid curated example at line {line_number}: {exc}") from exc
+        category = raw.get("category")
+        if category not in CURATED_CATEGORIES:
+            raise ValueError(f"Unknown curated category at line {line_number}: {category}")
+        record = make_record(
+            raw.get("instruction", ""),
+            raw.get("input", ""),
+            raw.get("response", ""),
+            category,
+            path.name,
+        )
+        if record is not None:
+            records.append(record)
+    return records
 
-    This second deduplication pass is intentional. It protects the final artifact
-    even if a future builder path bypasses ``add_record`` or introduces another
-    record-producing source. The first occurrence is retained deterministically.
-    """
+
+def deduplicate_records(records):
     unique = []
     seen_examples = set()
     seen_ids = set()
@@ -122,7 +133,6 @@ def deduplicate_records(records):
 
 
 def validate_unique_records(records):
-    """Raise if records are not unique by training-example content or id."""
     example_keys = [record_key(record) for record in records]
     ids = [record["id"] for record in records]
     if len(example_keys) != len(set(example_keys)):
@@ -132,46 +142,42 @@ def validate_unique_records(records):
 
 
 def build_records(source_root):
-    records = []
-    seen_ids = set()
-    seen_examples = set()
+    records = curated_examples(source_root)
+    seen_ids = {record["id"] for record in records}
+    seen_examples = {record_key(record) for record in records}
 
     def add_record(record):
         if record is None:
             return
-        example_key = record_key(record)
-        if example_key in seen_examples or record["id"] in seen_ids:
+        key = record_key(record)
+        if key in seen_examples or record["id"] in seen_ids:
             return
         records.append(record)
-        seen_examples.add(example_key)
+        seen_examples.add(key)
         seen_ids.add(record["id"])
 
     for path, text in read_text_files(source_root):
         source = str(path.relative_to(source_root)).replace("\\", "/")
         for question, answer in explicit_qa(text):
+            # Do not put the source answer into the model input. That creates a
+            # trivial copy task instead of question -> answer supervision.
             add_record(
                 make_record(
                     "Answer the question using only the provided source text.",
-                    f"Question: {question}\nSource answer: {answer}",
+                    question,
                     answer,
                     "source_qa",
                     source,
                 )
             )
 
+        # Keep passage-copy examples in the artifact for provenance/auditing. They
+        # are intentionally filtered out of SFT by InstructionDataset's default
+        # supervised category set.
         templates = [
-            (
-                "Extract the key information from the following medical passage.",
-                "grounded_extraction",
-            ),
-            (
-                "Explain the following passage without adding information not present in it.",
-                "grounded_explanation",
-            ),
-            (
-                "Provide the relevant source text for this request without inventing facts.",
-                "grounded_response",
-            ),
+            ("Extract the key information from the following medical passage.", "grounded_extraction"),
+            ("Explain the following passage without adding information not present in it.", "grounded_explanation"),
+            ("Provide the relevant source text for this request without inventing facts.", "grounded_response"),
         ]
         for passage in paragraphs(text):
             for instruction, category in templates:
@@ -201,7 +207,6 @@ def write_jsonl(records, path):
 
 
 def clean_output_dir(output_dir):
-    """Remove only artifacts owned by this builder before writing a new dataset."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     for filename in OUTPUT_SPLITS:
@@ -211,7 +216,6 @@ def clean_output_dir(output_dir):
 
 
 def verify_written_dataset(output_dir):
-    """Read all generated splits back and verify global uniqueness/disjointness."""
     output_dir = Path(output_dir)
     all_records = []
     split_ids = {}
@@ -236,25 +240,20 @@ def verify_written_dataset(output_dir):
     names = tuple(split_ids)
     for index, left in enumerate(names):
         for right in names[index + 1 :]:
-            overlap = split_ids[left] & split_ids[right]
-            if overlap:
+            if split_ids[left] & split_ids[right]:
                 raise RuntimeError(f"Generated splits overlap: {left} and {right}")
     return len(all_records)
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Build source-grounded instruction JSONL from LLM-Data."
-    )
+    parser = argparse.ArgumentParser(description="Build auditable instruction JSONL from LLM-Data.")
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=Path("data/instruction"))
     args = parser.parse_args()
 
     records = build_records(args.source_root)
     if len(records) < 100:
-        raise RuntimeError(
-            f"Only {len(records)} examples were produced; refusing to create a tiny fine-tuning set."
-        )
+        raise RuntimeError(f"Only {len(records)} examples were produced; refusing to create a tiny fine-tuning set.")
 
     clean_output_dir(args.output_dir)
     train, validation, test = split(records)
@@ -264,9 +263,7 @@ def main():
 
     written_total = verify_written_dataset(args.output_dir)
     if written_total != len(records):
-        raise RuntimeError(
-            f"Generated dataset count mismatch: built {len(records)}, wrote {written_total}"
-        )
+        raise RuntimeError(f"Generated dataset count mismatch: built {len(records)}, wrote {written_total}")
 
     manifest = {
         "source_root": str(args.source_root),
@@ -274,16 +271,12 @@ def main():
         "train": len(train),
         "validation": len(validation),
         "test": len(test),
-        "categories": {
-            category: sum(r["category"] == category for r in records)
-            for category in sorted({r["category"] for r in records})
-        },
+        "categories": {category: sum(r["category"] == category for r in records) for category in sorted({r["category"] for r in records})},
+        "sft_categories": ["health_information", "simplification", "source_qa", "summarization", "terminology"],
         "duplicate_examples": 0,
-        "provenance": "Every response is copied from the source passage or an explicit Q/A answer; no generated medical facts are introduced.",
+        "provenance": "Responses are copied from explicit source answers or curated healthcare examples; passage-copy records are retained for provenance but excluded from default SFT.",
     }
-    (args.output_dir / "manifest.json").write_text(
-        json.dumps(manifest, indent=2), encoding="utf-8"
-    )
+    (args.output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print(json.dumps(manifest, indent=2))
 
 

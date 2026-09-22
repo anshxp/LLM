@@ -38,7 +38,7 @@ data/raw
 data/metadata
 data/processed
 data/raw
-
+data/
 
 # =========================
 # ML / LLM model files

@@ -151,7 +151,11 @@ def build_records(source_root):
                 if record is not None:
                     all_records.append(record)
 
-    return deduplicate_records(supervised_records), deduplicate_records(all_records)
+    supervised_records = deduplicate_records(supervised_records)
+    all_records = deduplicate_records(all_records)
+    validate_unique_records(supervised_records)
+    validate_unique_records(all_records)
+    return supervised_records, all_records
 
 
 def split(records, train_ratio=0.9, validation_ratio=0.05):

@@ -1,4 +1,9 @@
-"""Build auditable instruction-tuning JSONL from the existing LLM-Data corpus."""
+"""Build deterministic supervised and audit instruction datasets.
+
+The supervised dataset contains only curated healthcare examples and explicit source Q/A.
+Passage-copy examples are returned separately as an audit corpus and are never written into
+the default SFT dataset.
+"""
 
 import argparse
 import hashlib
@@ -6,9 +11,17 @@ import json
 import re
 from pathlib import Path
 
-SFT_CATEGORIES = {"health_information", "simplification", "source_qa", "summarization", "terminology"}
+SFT_CATEGORIES = frozenset(
+    {"health_information", "simplification", "source_qa", "summarization", "terminology"}
+)
+PASSAGE_CATEGORIES = (
+    ("grounded_extraction", "Extract the key information from the following medical passage."),
+    ("grounded_explanation", "Explain the following passage without adding information not present in it."),
+    ("grounded_response", "Provide the relevant source text for this request without inventing facts."),
+)
 FIELDS = ("instruction", "input", "response", "category", "source")
-CURATED_PATH = Path("healthcare_examples.jsonl")
+CURATED_FILENAME = "healthcare_examples.jsonl"
+GENERATED_FILENAMES = {"train.jsonl", "validation.jsonl", "test.jsonl", "manifest.json"}
 
 
 def normalize(text):
@@ -16,38 +29,46 @@ def normalize(text):
 
 
 def stable_id(record):
-    return hashlib.sha256("\n".join(record[k] for k in FIELDS).encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256("\n".join(record[field] for field in FIELDS).encode("utf-8")).hexdigest()[:16]
 
 
-def make_record(instruction, source_text, response, category, source):
-    instruction, source_text, response = normalize(instruction), normalize(source_text), normalize(response)
-    if not instruction or not source_text or not response:
+def record_key(record):
+    return tuple(record[field] for field in ("instruction", "input", "response"))
+
+
+def make_record(instruction, input_text, response, category, source):
+    values = [normalize(instruction), normalize(input_text), normalize(response)]
+    if not all(values):
         return None
-    record = {"instruction": instruction, "input": source_text, "response": response,
-              "category": category, "source": source}
+    record = {
+        "instruction": values[0],
+        "input": values[1],
+        "response": values[2],
+        "category": normalize(category),
+        "source": normalize(source),
+    }
     record["id"] = stable_id(record)
     return record
 
 
-def record_key(record):
-    return tuple(record[k] for k in ("instruction", "input", "response"))
-
-
 def deduplicate_records(records):
-    unique, seen = [], set()
+    unique = []
+    seen_examples = set()
+    seen_ids = set()
     for record in records:
         key = record_key(record)
-        if key in seen:
+        if key in seen_examples or record["id"] in seen_ids:
             continue
-        seen.add(key)
         unique.append(record)
+        seen_examples.add(key)
+        seen_ids.add(record["id"])
     return unique
 
 
 def validate_unique_records(records):
-    keys = [record_key(r) for r in records]
-    ids = [r["id"] for r in records]
-    if len(keys) != len(set(keys)):
+    example_keys = [record_key(record) for record in records]
+    ids = [record["id"] for record in records]
+    if len(example_keys) != len(set(example_keys)):
         raise ValueError("Instruction builder produced duplicate examples")
     if len(ids) != len(set(ids)):
         raise ValueError("Instruction builder produced duplicate record ids")
@@ -56,17 +77,19 @@ def validate_unique_records(records):
 def read_text_files(root):
     root = Path(root)
     for path in sorted(root.rglob("*")):
-        if path.is_file() and path.suffix.lower() in {".txt", ".md"}:
-            try:
-                text = path.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
-            if text.strip():
-                yield path, text
+        if not path.is_file() or path.suffix.lower() not in {".txt", ".md"}:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if text.strip():
+            yield path, text
 
 
-def paragraphs(text, min_chars=160, max_chars=1800):
-    for block in re.split(r"\n\s*\n+", text):
+def paragraphs(text, min_chars=120, max_chars=1800):
+    blocks = re.split(r"\n\s*\n+", text)
+    for block in blocks:
         block = normalize(block)
         if len(block) < min_chars:
             continue
@@ -85,14 +108,15 @@ def paragraphs(text, min_chars=160, max_chars=1800):
 
 
 def explicit_qa(text):
-    lines = [normalize(x) for x in text.splitlines() if normalize(x)]
-    for i, line in enumerate(lines[:-1]):
-        if line.endswith("?") and len(line) >= 10 and len(lines[i + 1]) >= 40:
-            yield line, lines[i + 1]
+    lines = [normalize(line) for line in text.splitlines() if normalize(line)]
+    for index, question in enumerate(lines[:-1]):
+        answer = lines[index + 1]
+        if question.endswith("?") and len(question) >= 10 and len(answer) >= 40:
+            yield question, answer
 
 
-def curated_examples(source_root):
-    path = Path(source_root) / CURATED_PATH
+def load_curated_examples(source_root):
+    path = Path(source_root) / CURATED_FILENAME
     if not path.exists():
         return []
     records = []
@@ -103,128 +127,179 @@ def curated_examples(source_root):
             raw = json.loads(line)
         except json.JSONDecodeError as exc:
             raise ValueError(f"Invalid curated example at line {line_number}: {exc}") from exc
-        required = ("instruction", "input", "response", "category")
-        if any(not normalize(raw.get(field, "")) for field in required):
-            raise ValueError(f"Invalid curated example at line {line_number}: missing required field")
-        if raw["category"] not in SFT_CATEGORIES:
-            raise ValueError(f"Invalid curated example at line {line_number}: unsupported category {raw['category']!r}")
-        record = make_record(raw["instruction"], raw["input"], raw["response"], raw["category"], raw.get("source", str(CURATED_PATH)))
+        for field in ("instruction", "input", "response", "category"):
+            if not normalize(raw.get(field, "")):
+                raise ValueError(f"Invalid curated example at line {line_number}: missing {field}")
+        category = normalize(raw["category"])
+        if category not in SFT_CATEGORIES:
+            raise ValueError(
+                f"Invalid curated example at line {line_number}: unsupported category {category!r}"
+            )
+        record = make_record(
+            raw["instruction"],
+            raw["input"],
+            raw["response"],
+            category,
+            raw.get("source", CURATED_FILENAME),
+        )
         if record:
             records.append(record)
-    return deduplicate_records(records)
+    records = deduplicate_records(records)
+    validate_unique_records(records)
+    return records
 
 
 def build_records(source_root):
     source_root = Path(source_root)
-    supervised_records = curated_examples(source_root)
-    seen_ids = {r["id"] for r in supervised_records}
-    seen_examples = {record_key(r) for r in supervised_records}
+    supervised = load_curated_examples(source_root)
+    supervised_keys = {record_key(record) for record in supervised}
+    supervised_ids = {record["id"] for record in supervised}
+    audit = list(supervised)
 
     def add_supervised(record):
         if record is None:
             return
         key = record_key(record)
-        if key in seen_examples or record["id"] in seen_ids:
+        if key in supervised_keys or record["id"] in supervised_ids:
             return
-        supervised_records.append(record)
-        seen_examples.add(key)
-        seen_ids.add(record["id"])
+        supervised.append(record)
+        supervised_keys.add(key)
+        supervised_ids.add(record["id"])
 
     for path, text in read_text_files(source_root):
-        if path.name == CURATED_PATH.name:
+        if path.name == CURATED_FILENAME:
             continue
         source = str(path.relative_to(source_root)).replace("\\", "/")
         for question, answer in explicit_qa(text):
-            add_supervised(make_record("Answer the question using only the provided source text.", question, answer, "source_qa", source))
+            add_supervised(
+                make_record(
+                    "Answer the question using only the provided source text.",
+                    question,
+                    answer,
+                    "source_qa",
+                    source,
+                )
+            )
 
-    all_records = list(supervised_records)
+    # Build the audit corpus independently. It contains supervised examples plus passage
+    # copies from source files. The curated JSONL is deliberately excluded from raw text
+    # scanning so it cannot be transformed into passage-copy records.
     for path, text in read_text_files(source_root):
-        if path.name == CURATED_PATH.name:
+        if path.name == CURATED_FILENAME:
             continue
         source = str(path.relative_to(source_root)).replace("\\", "/")
-        templates = (("Extract the key information from the following medical passage.", "grounded_extraction"),
-                     ("Explain the following passage without adding information not present in it.", "grounded_explanation"),
-                     ("Provide the relevant source text for this request without inventing facts.", "grounded_response"))
         for passage in paragraphs(text):
-            for instruction, category in templates:
+            for category, instruction in PASSAGE_CATEGORIES:
                 record = make_record(instruction, passage, passage, category, source)
-                if record is not None:
-                    all_records.append(record)
+                if record:
+                    audit.append(record)
 
-    supervised_records = deduplicate_records(supervised_records)
-    all_records = deduplicate_records(all_records)
-    validate_unique_records(supervised_records)
-    validate_unique_records(all_records)
-    return supervised_records, all_records
+    supervised = deduplicate_records(supervised)
+    audit = deduplicate_records(audit)
+    validate_unique_records(supervised)
+    validate_unique_records(audit)
+    if not set(record_key(record) for record in supervised).issubset(
+        {record_key(record) for record in audit}
+    ):
+        raise ValueError("Audit corpus must contain every supervised example")
+    return supervised, audit
 
 
 def split(records, train_ratio=0.9, validation_ratio=0.05):
-    records = sorted(deduplicate_records(records), key=lambda r: r["id"])
+    records = sorted(deduplicate_records(records), key=lambda record: record["id"])
     validate_unique_records(records)
-    n = len(records)
-    if n < 3:
+    if len(records) < 3:
         raise ValueError("At least 3 records are required to create train/validation/test splits.")
-    train_count = max(1, int(n * train_ratio))
-    validation_count = max(1, int(n * validation_ratio))
-    if train_count + validation_count >= n:
+    train_count = max(1, int(len(records) * train_ratio))
+    validation_count = max(1, int(len(records) * validation_ratio))
+    if train_count + validation_count >= len(records):
+        train_count = len(records) - 2
         validation_count = 1
-        train_count = n - 2
-    return records[:train_count], records[train_count:train_count + validation_count], records[train_count + validation_count:]
+    return (
+        records[:train_count],
+        records[train_count:train_count + validation_count],
+        records[train_count + validation_count:],
+    )
 
 
 def write_jsonl(records, path):
+    validate_unique_records(records)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
+    with Path(path).open("w", encoding="utf-8") as handle:
         for record in records:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def clean_output_dir(path):
-    path.mkdir(parents=True, exist_ok=True)
-    for name in ("train.jsonl", "validation.jsonl", "test.jsonl", "manifest.json"):
-        (path / name).unlink(missing_ok=True)
+def clean_output_dir(output_dir):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for filename in GENERATED_FILENAMES:
+        (output_dir / filename).unlink(missing_ok=True)
 
 
-def verify_written_dataset(path):
-    records = []
-    for name in ("train.jsonl", "validation.jsonl", "test.jsonl"):
-        file = path / name
-        if file.exists():
-            for line in file.read_text(encoding="utf-8").splitlines():
-                if line.strip():
-                    records.append(json.loads(line))
-    records = deduplicate_records(records)
-    validate_unique_records(records)
-    return len(records)
+def verify_written_dataset(output_dir):
+    output_dir = Path(output_dir)
+    splits = {}
+    all_records = []
+    for split_name in ("train", "validation", "test"):
+        path = output_dir / f"{split_name}.jsonl"
+        records = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        validate_unique_records(records)
+        splits[split_name] = records
+        all_records.extend(records)
+    validate_unique_records(all_records)
+    ids = {name: {record["id"] for record in records} for name, records in splits.items()}
+    if ids["train"] & ids["validation"] or ids["train"] & ids["test"] or ids["validation"] & ids["test"]:
+        raise RuntimeError("Generated splits overlap")
+    return len(all_records)
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Build deterministic instruction-tuning data.")
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=Path("data/instruction"))
     parser.add_argument("--min-supervised-examples", type=int, default=100)
     args = parser.parse_args()
 
-    supervised_records, all_records = build_records(args.source_root)
-    if len(supervised_records) < args.min_supervised_examples:
-        raise RuntimeError(f"Only {len(supervised_records)} supervised examples were produced; need at least {args.min_supervised_examples}.")
+    supervised, audit = build_records(args.source_root)
+    if len(supervised) < args.min_supervised_examples:
+        raise RuntimeError(
+            f"Only {len(supervised)} supervised examples were produced; "
+            f"need at least {args.min_supervised_examples}. Add reviewed/generated QA before SFT."
+        )
 
     clean_output_dir(args.output_dir)
-    train, validation, test = split(supervised_records)
+    train, validation, test = split(supervised)
     write_jsonl(train, args.output_dir / "train.jsonl")
     write_jsonl(validation, args.output_dir / "validation.jsonl")
     write_jsonl(test, args.output_dir / "test.jsonl")
     written_total = verify_written_dataset(args.output_dir)
-    if written_total != len(supervised_records):
-        raise RuntimeError(f"Generated supervised dataset count mismatch: built {len(supervised_records)}, wrote {written_total}")
+    if written_total != len(supervised):
+        raise RuntimeError(
+            f"Generated supervised dataset count mismatch: built {len(supervised)}, wrote {written_total}"
+        )
 
-    manifest = {"source_root": str(args.source_root), "supervised_total": len(supervised_records),
-                "train": len(train), "validation": len(validation), "test": len(test),
-                "supervised_categories": {c: sum(r["category"] == c for r in supervised_records) for c in sorted({r["category"] for r in supervised_records})},
-                "passage_copy_total": max(0, len(all_records) - len(supervised_records)),
-                "sft_categories": sorted(SFT_CATEGORIES), "duplicate_examples": 0,
-                "provenance": "SFT records come only from curated healthcare examples or explicit source Q/A. Passage-copy records are excluded from the supervised artifact."}
-    (args.output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    categories = {category: sum(record["category"] == category for record in supervised)
+                  for category in sorted({record["category"] for record in supervised})}
+    manifest = {
+        "source_root": str(args.source_root),
+        "supervised_total": len(supervised),
+        "train": len(train),
+        "validation": len(validation),
+        "test": len(test),
+        "supervised_categories": categories,
+        "passage_copy_total": sum(record["category"] not in SFT_CATEGORIES for record in audit),
+        "sft_categories": sorted(SFT_CATEGORIES),
+        "duplicate_examples": 0,
+        "provenance": "SFT records come only from curated healthcare examples or explicit source Q/A. Passage-copy records are retained only in the in-memory audit corpus.",
+    }
+    (args.output_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8"
+    )
     print(json.dumps(manifest, indent=2))
 
 

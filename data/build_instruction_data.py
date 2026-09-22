@@ -185,7 +185,7 @@ def build_records(source_root):
                 if record is not None:
                     passage_records.append(record)
 
-    return deduplicate_records(records), deduplicate_records(passage_records)
+    return supervised_records, deduplicate_records(passage_records)
 
 
 def split(records, train_ratio=0.9, validation_ratio=0.05):

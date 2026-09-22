@@ -99,5 +99,5 @@ def test_generation_rejects_invalid_decoding_arguments(kwargs):
 def test_generation_rejects_non_matrix_input():
     model = TinyModel()
 
-    with pytest.raises(ValueError, match="shape \[batch, sequence\]"):
+    with pytest.raises(ValueError, match=r"shape \[batch, sequence\]"):
         generate(model, torch.tensor([1, 2]), max_new_tokens=1, do_sample=False)

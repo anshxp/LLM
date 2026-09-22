@@ -11,10 +11,12 @@ from data.tokenizer import Tokenizer
 
 
 DEFAULT_TOKENIZER = Path("data/processed/tokenizer.json")
+DEFAULT_SFT_CATEGORIES = frozenset(
+    {"terminology", "simplification", "summarization", "health_information", "source_qa"}
+)
 
 
 def format_example(record):
-    """Format an instruction example into the training prompt template."""
     record = validate_example(record)
     instruction = record["instruction"]
     user_input = record["input"]
@@ -29,11 +31,12 @@ def format_example(record):
     return prompt, response
 
 
-def load_jsonl(path):
+def load_jsonl(path, categories=None):
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Instruction dataset not found: {path}")
 
+    allowed = None if categories is None else set(categories)
     records = []
     seen = set()
     for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
@@ -47,9 +50,12 @@ def load_jsonl(path):
         if key in seen:
             raise ValueError(f"Duplicate instruction record at line {line_number}")
         seen.add(key)
-        records.append(record)
+        if allowed is None or record["category"] in allowed:
+            records.append(record)
 
     if not records:
+        if allowed:
+            raise ValueError(f"Instruction dataset contains no examples in categories: {sorted(allowed)}")
         raise ValueError("Instruction dataset contains no examples")
     return records
 
@@ -73,8 +79,6 @@ class InstructionDataset(Dataset):
         if not response_ids:
             raise ValueError("Instruction response must contain at least one token")
 
-        # Preserve the response when possible. If the response itself is longer
-        # than context, retain its newest tokens and keep EOS as the final token.
         if len(response_ids) >= max_tokens:
             response_ids = response_ids[-max_tokens:]
             prompt_ids = []
@@ -88,8 +92,6 @@ class InstructionDataset(Dataset):
 
         inputs = torch.tensor(token_ids[:-1], dtype=torch.long)
         labels = torch.tensor(token_ids[1:], dtype=torch.long)
-
-        # Tokens whose target is still part of the prompt do not contribute to loss.
         prompt_target_count = max(0, len(prompt_ids) - 1)
         labels[:prompt_target_count] = -100
         return inputs, labels
@@ -102,20 +104,12 @@ class InstructionDataset(Dataset):
 
 
 def collate_instruction_batch(batch):
-    """Pad variable-length instruction examples for batched training.
-
-    Input padding uses token id 0. Label padding uses -100 so padded positions
-    are ignored by cross-entropy. Because padding is appended after each example,
-    it cannot leak information into later non-padding response tokens.
-    """
     if not batch:
         raise ValueError("Cannot collate an empty instruction batch")
 
     max_length = max(inputs.size(0) for inputs, _ in batch)
     input_ids = torch.zeros((len(batch), max_length), dtype=torch.long)
-    target_ids = torch.full(
-        (len(batch), max_length), -100, dtype=torch.long
-    )
+    target_ids = torch.full((len(batch), max_length), -100, dtype=torch.long)
 
     for index, (inputs, labels) in enumerate(batch):
         length = inputs.size(0)

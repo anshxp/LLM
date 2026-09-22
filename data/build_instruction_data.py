@@ -214,7 +214,9 @@ def main():
     write_jsonl(train, args.output_dir / "train.jsonl")
     write_jsonl(validation, args.output_dir / "validation.jsonl")
     write_jsonl(test, args.output_dir / "test.jsonl")
-    verify_written_dataset(args.output_dir)
+    written_total = verify_written_dataset(args.output_dir)
+    if written_total != len(supervised_records):
+        raise RuntimeError(f"Generated supervised dataset count mismatch: built {len(supervised_records)}, wrote {written_total}")
 
     manifest = {"source_root": str(args.source_root), "supervised_total": len(supervised_records),
                 "train": len(train), "validation": len(validation), "test": len(test),

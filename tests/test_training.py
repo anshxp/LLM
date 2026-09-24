@@ -61,9 +61,7 @@ def test_checkpoint_round_trip(tmp_path):
     )
     path = tmp_path / "model.pt"
 
-    input_ids = torch.randint(
-        0, config.vocab_size, (2, config.context_length)
-    )
+    input_ids = torch.randint(0, config.vocab_size, (2, config.context_length))
     model.eval()
     with torch.no_grad():
         before = model(input_ids)
@@ -159,7 +157,10 @@ def test_instruction_training_cli_uses_sft_defaults():
 
     assert args.learning_rate == DEFAULT_SFT_LEARNING_RATE
     assert args.lr_min == DEFAULT_SFT_LR_MIN
-    assert str(args.pretrained_checkpoint).endswith("checkpoints\\phase7_run\\best_model.pt")
+    assert args.pretrained_checkpoint == DEFAULT_PRETRAIN_CHECKPOINT
+    assert args.pretrained_checkpoint.as_posix().endswith(
+        "checkpoints/phase7_run/best_model.pt"
+    )
 
 
 def test_instruction_training_cli_allows_sft_override():

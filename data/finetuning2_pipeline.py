@@ -5,7 +5,7 @@ and over-context examples, performs disk-backed global exact deduplication, and
 writes deterministic JSONL shards. It never modifies the source corpus or trains.
 """
 from __future__ import annotations
-import argparse, csv, hashlib, json, re, sqlite3, zipfile
+import argparse, csv, hashlib, json, re, sqlite3, sys, time, zipfile
 from collections import Counter
 from pathlib import Path
 from typing import Iterable
@@ -130,31 +130,40 @@ def token_stats(record,tokenizer,context_length):
     prompt=f"### Instruction:\n{record['instruction']}\n\n### Input:\n{record['input']}\n\n### Response:\n"; prompt_ids=tokenizer.encode(prompt,add_bos=True); response_ids=tokenizer.encode(record["response"],add_eos=True); ids=prompt_ids+response_ids; unk_id=tokenizer.token_to_id["<unk>"]
     return {"prompt_tokens":len(prompt_ids),"response_tokens":len(response_ids),"total_tokens":len(ids),"unk_tokens":sum(x==unk_id for x in ids),"fits_context":len(ids)<=context_length+1}
 
-def build(source_root:Path,output_dir:Path,tokenizer_path:Path,context_length:int,shard_size:int=50000):
+def build(source_root:Path,output_dir:Path,tokenizer_path:Path,context_length:int,shard_size:int=50000,progress_every:int=1000):
+    started=time.perf_counter()
+    def progress(message):
+        print(f"[finetuning2] {message}",file=sys.stderr,flush=True)
+
+    progress(f"Starting build: source={source_root} output={output_dir}")
+    progress(f"Tokenizer={tokenizer_path} context_length={context_length} shard_size={shard_size} progress_every={progress_every}")
     tokenizer=Tokenizer.from_file(tokenizer_path); output_dir.mkdir(parents=True,exist_ok=True)
     for old in output_dir.glob("*.jsonl"): old.unlink()
     for old in (output_dir/"manifest.json",output_dir/"dedup.sqlite3"): old.unlink(missing_ok=True)
     seen=sqlite3.connect(output_dir/"dedup.sqlite3"); seen.execute("PRAGMA journal_mode=WAL"); seen.execute("CREATE TABLE seen (key BLOB PRIMARY KEY)"); seen.commit()
-    counts=Counter(); sources=Counter(); rejects=Counter(); lengths=Counter(); total_tokens=unk_tokens=0; handles={}; shard_counts=Counter(); rejection_handle=(output_dir/"rejections.jsonl").open("w",encoding="utf-8")
+    counts=Counter(); sources=Counter(); rejects=Counter(); lengths=Counter(); total_tokens=unk_tokens=0; handles={}; shard_counts=Counter(); records_processed=0; rejection_handle=(output_dir/"rejections.jsonl").open("w",encoding="utf-8")
     def handle_for(split):
         index=shard_counts[split]//shard_size; key=(split,index)
-        if key not in handles: handles[key]=(output_dir/f"{split}-{index:05d}.jsonl").open("w",encoding="utf-8")
+        if key not in handles: handles[key]=(output_dir/f"{split}-{index:05d}.jsonl").open("w",encoding="utf-8"); progress(f"Opened shard {split}-{index:05d}.jsonl")
         return handles[key]
     try:
         for path in iter_files(source_root):
-            relative=source_name(str(path.relative_to(source_root)))
+            relative=source_name(str(path.relative_to(source_root))); file_started=time.perf_counter()
+            progress(f"Reading {relative}")
             try:
                 suffix=path.suffix.lower()
                 if suffix in {".parquet",".xlsx"}: sources_iter=[(relative,suffix,path)]
                 elif suffix==".zip": sources_iter=list(iter_archive(path))
                 else: sources_iter=[(relative,suffix,path.read_text(encoding="utf-8",errors="ignore"))]
                 for source,suffix,payload in sources_iter:
-                    counts["files_or_members"]+=1
+                    counts["files_or_members"]+=1; member_started=time.perf_counter(); member_processed=0
+                    progress(f"Processing {source}")
                     try:
                         if suffix==".parquet": records=parse_parquet(payload,source)
                         elif suffix==".xlsx": records=parse_xlsx(payload,source)
                         else: records=parse_source(suffix,payload,source)
                         for record in records:
+                            member_processed+=1; records_processed+=1
                             if record is None: rejects["empty_or_invalid"]+=1; continue
                             key_text="\n".join((record["instruction"].lower(),record["input"].lower(),record["response"].lower())); key_hash=hashlib.sha256(key_text.encode()).digest()
                             inserted=seen.execute("INSERT OR IGNORE INTO seen(key) VALUES (?)",(key_hash,)).rowcount
@@ -163,20 +172,26 @@ def build(source_root:Path,output_dir:Path,tokenizer_path:Path,context_length:in
                             if not stats["fits_context"]:
                                 rejects["over_context"]+=1; rejection_handle.write(json.dumps({"reason":"over_context","record":record,"stats":stats},ensure_ascii=False)+"\n"); continue
                             split=split_name(record["id"]); record.update(stats); handle_for(split).write(json.dumps(record,ensure_ascii=False)+"\n"); shard_counts[split]+=1; sources[source]+=1
-                        seen.commit()
+                            if progress_every and records_processed%progress_every==0:
+                                accepted=sum(shard_counts.values()); progress(f"Progress: processed={records_processed:,} accepted={accepted:,} duplicates={rejects['duplicate']:,} over_context={rejects['over_context']:,} elapsed={time.perf_counter()-started:.1f}s")
+                        seen.commit(); progress(f"Finished {source}: records={member_processed:,} elapsed={time.perf_counter()-member_started:.1f}s")
                     except Exception as exc:
-                        rejects[f"parse_error:{type(exc).__name__}"]+=1; rejection_handle.write(json.dumps({"reason":f"parse_error:{type(exc).__name__}","source":source,"error":str(exc)},ensure_ascii=False)+"\n")
+                        rejects[f"parse_error:{type(exc).__name__}"]+=1; rejection_handle.write(json.dumps({"reason":f"parse_error:{type(exc).__name__}","source":source,"error":str(exc)},ensure_ascii=False)+"\n"); progress(f"ERROR in {source}: {type(exc).__name__}: {exc}")
             except Exception as exc:
-                rejects[f"file_error:{type(exc).__name__}"]+=1; rejection_handle.write(json.dumps({"reason":f"file_error:{type(exc).__name__}","source":relative,"error":str(exc)},ensure_ascii=False)+"\n")
+                rejects[f"file_error:{type(exc).__name__}"]+=1; rejection_handle.write(json.dumps({"reason":f"file_error:{type(exc).__name__}","source":relative,"error":str(exc)},ensure_ascii=False)+"\n"); progress(f"ERROR in {relative}: {type(exc).__name__}: {exc}")
+            progress(f"Finished file {relative} in {time.perf_counter()-file_started:.1f}s")
     finally:
         rejection_handle.close(); seen.commit(); seen.close()
         for handle in handles.values(): handle.close()
     accepted=sum(shard_counts.values()); manifest={"source_root":str(source_root),"tokenizer":str(tokenizer_path),"context_length":context_length,"files_or_archive_members_seen":counts["files_or_members"],"unique_records_seen":sum(shard_counts.values())+rejects["over_context"],"accepted_records":accepted,"train_records":shard_counts["train"],"validation_records":shard_counts["validation"],"test_records":shard_counts["test"],"rejections":dict(rejects),"length_distribution":dict(lengths),"average_tokens":total_tokens/max(1,sum(lengths.values())),"unk_token_rate":unk_tokens/max(1,total_tokens),"source_counts":dict(sources),"split_policy":"stable hash of record id: 90% train, 5% validation, 5% test","deduplication":"disk-backed SQLite SHA-256 key index"}
-    (output_dir/"manifest.json").write_text(json.dumps(manifest,indent=2,ensure_ascii=False),encoding="utf-8"); return manifest
+    (output_dir/"manifest.json").write_text(json.dumps(manifest,indent=2,ensure_ascii=False),encoding="utf-8")
+    progress(f"Completed: accepted={accepted:,} train={shard_counts['train']:,} validation={shard_counts['validation']:,} test={shard_counts['test']:,} elapsed={time.perf_counter()-started:.1f}s")
+    return manifest
 
 def main():
-    parser=argparse.ArgumentParser(description="Prepare Fine tuning 2 for second SFT."); parser.add_argument("--source-root",type=Path,default=Path("data/Fine tuning 2")); parser.add_argument("--output-dir",type=Path,default=Path("data/instruction_v2")); parser.add_argument("--tokenizer",type=Path,default=Path("data/processed/tokenizer.json")); parser.add_argument("--context-length",type=int,default=256); parser.add_argument("--shard-size",type=int,default=50000); args=parser.parse_args()
+    parser=argparse.ArgumentParser(description="Prepare Fine tuning 2 for second SFT."); parser.add_argument("--source-root",type=Path,default=Path("data/Fine tuning 2")); parser.add_argument("--output-dir",type=Path,default=Path("data/instruction_v2")); parser.add_argument("--tokenizer",type=Path,default=Path("data/processed/tokenizer.json")); parser.add_argument("--context-length",type=int,default=256); parser.add_argument("--shard-size",type=int,default=50000); parser.add_argument("--progress-every",type=int,default=1000,help="Print tokenization progress every N records; use 0 to disable"); args=parser.parse_args()
     if not args.source_root.is_dir(): raise FileNotFoundError(f"Fine tuning 2 directory not found: {args.source_root}")
     if args.context_length<2 or args.shard_size<=0: raise ValueError("context-length must be >= 2 and shard-size must be positive")
-    print(json.dumps(build(args.source_root,args.output_dir,args.tokenizer,args.context_length,args.shard_size),indent=2,ensure_ascii=False))
+    if args.progress_every<0: raise ValueError("progress-every must be >= 0")
+    print(json.dumps(build(args.source_root,args.output_dir,args.tokenizer,args.context_length,args.shard_size,args.progress_every),indent=2,ensure_ascii=False))
 if __name__=="__main__": main()

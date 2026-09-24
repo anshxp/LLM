@@ -5,3 +5,5 @@ pymupdf
 tokenizers
 fastapi
 uvicorn[standard]
+pyarrow
+openpyxl

@@ -1,11 +1,11 @@
 """Ingest the complete local Fine tuning 2 corpus for second SFT.
 
-Raw data stays local. This module normalizes supervised records, audits malformed
-and over-context examples, performs global exact deduplication, and writes lazy-
-training-compatible JSONL shards. It never modifies the source corpus or trains.
+Raw data stays local. The pipeline normalizes supervised records, audits malformed
+and over-context examples, performs disk-backed global exact deduplication, and
+writes deterministic JSONL shards. It never modifies the source corpus or trains.
 """
 from __future__ import annotations
-import argparse, csv, hashlib, json, re, zipfile
+import argparse, csv, hashlib, json, re, sqlite3, zipfile
 from collections import Counter
 from pathlib import Path
 from typing import Iterable
@@ -25,12 +25,10 @@ def clean(value)->str:
 def source_name(path:str)->str: return path.replace("\\","/")
 
 def make_record(instruction,input_text,response,category,source,source_id=""):
-    instruction,input_text,response=map(clean,(instruction,input_text,response))
-    category=clean(category) or "fine_tuning_2"
+    instruction,input_text,response=map(clean,(instruction,input_text,response)); category=clean(category) or "fine_tuning_2"
     if not instruction or not response: return None
     record={"instruction":instruction,"input":input_text,"response":response,"category":category,"source":source_name(source),"source_id":clean(source_id)}
-    record["id"]=hashlib.sha256(json.dumps(record,ensure_ascii=False,sort_keys=True).encode()).hexdigest()
-    return record
+    record["id"]=hashlib.sha256(json.dumps(record,ensure_ascii=False,sort_keys=True).encode()).hexdigest(); return record
 
 def first_value(obj,fields):
     if not isinstance(obj,dict): return ""
@@ -46,8 +44,7 @@ def conversation_record(obj,source,source_id):
     user_parts=[]; assistant=""
     for message in messages:
         if not isinstance(message,dict): continue
-        role=clean(message.get("role") or message.get("from") or message.get("speaker")).lower()
-        text=clean(message.get("content") or message.get("text") or message.get("value"))
+        role=clean(message.get("role") or message.get("from") or message.get("speaker")).lower(); text=clean(message.get("content") or message.get("text") or message.get("value"))
         if not text: continue
         if role in ROLE_USER: user_parts.append(text)
         elif role in ROLE_ASSISTANT and user_parts: assistant=text
@@ -82,8 +79,7 @@ def xml_text(element): return clean(" ".join(element.itertext())) if element is 
 def parse_xml(text,source):
     root=ElementTree.fromstring(text)
     for node in root.iter():
-        children={child.tag.split("}")[-1].lower():xml_text(child) for child in list(node)}
-        question=first_value(children,QUESTION_FIELDS); answer=first_value(children,ANSWER_FIELDS)
+        children={child.tag.split("}")[-1].lower():xml_text(child) for child in list(node)}; question=first_value(children,QUESTION_FIELDS); answer=first_value(children,ANSWER_FIELDS)
         if question and answer: yield make_record("Answer the question accurately.",question,answer,"question_answer",source,node.tag)
 def parse_text(text,source):
     lines=[clean(x) for x in text.splitlines() if clean(x)]
@@ -92,8 +88,9 @@ def parse_text(text,source):
 
 def parse_parquet(path,source):
     import pyarrow.parquet as pq
-    table=pq.read_table(path)
-    for index,row in enumerate(table.to_pylist()): yield from records_from_object(row,source,str(index))
+    parquet=pq.ParquetFile(path)
+    for batch in parquet.iter_batches(batch_size=10000):
+        for index,row in enumerate(batch.to_pylist()): yield from records_from_object(row,source,str(index))
 
 def parse_xlsx(path,source):
     from openpyxl import load_workbook
@@ -104,8 +101,7 @@ def parse_xlsx(path,source):
             try: headers=[clean(x).lower() for x in next(rows)]
             except StopIteration: continue
             for index,values in enumerate(rows,2):
-                row={headers[i]:values[i] for i in range(min(len(headers),len(values))) if headers[i]}
-                yield from records_from_object(row,source,f"{sheet.title}:{index}")
+                row={headers[i]:values[i] for i in range(min(len(headers),len(values))) if headers[i]}; yield from records_from_object(row,source,f"{sheet.title}:{index}")
     finally: workbook.close()
 
 def iter_archive(path:Path):
@@ -114,8 +110,7 @@ def iter_archive(path:Path):
             if name.endswith("/"): continue
             suffix=Path(name).suffix.lower()
             if suffix not in SUPPORTED-{".zip",".parquet",".xlsx"}: continue
-            raw=archive.read(name)
-            yield source_name(f"{path}::{name}"),suffix,raw.decode("utf-8",errors="ignore")
+            yield source_name(f"{path}::{name}"),suffix,archive.read(name).decode("utf-8",errors="ignore")
 
 def parse_source(suffix,text,source):
     if suffix==".json": yield from parse_json(text,source)
@@ -129,20 +124,18 @@ def iter_files(root:Path):
         if path.is_file() and path.suffix.lower() in SUPPORTED: yield path
 
 def split_name(record_id:str)->str:
-    value=int(record_id[:8],16)%100
-    return "train" if value<90 else "validation" if value<95 else "test"
+    value=int(record_id[:8],16)%100; return "train" if value<90 else "validation" if value<95 else "test"
 
 def token_stats(record,tokenizer,context_length):
-    prompt=f"### Instruction:\n{record['instruction']}\n\n### Input:\n{record['input']}\n\n### Response:\n"
-    prompt_ids=tokenizer.encode(prompt,add_bos=True); response_ids=tokenizer.encode(record["response"],add_eos=True); ids=prompt_ids+response_ids
-    unk_id=tokenizer.token_to_id["<unk>"]
+    prompt=f"### Instruction:\n{record['instruction']}\n\n### Input:\n{record['input']}\n\n### Response:\n"; prompt_ids=tokenizer.encode(prompt,add_bos=True); response_ids=tokenizer.encode(record["response"],add_eos=True); ids=prompt_ids+response_ids; unk_id=tokenizer.token_to_id["<unk>"]
     return {"prompt_tokens":len(prompt_ids),"response_tokens":len(response_ids),"total_tokens":len(ids),"unk_tokens":sum(x==unk_id for x in ids),"fits_context":len(ids)<=context_length+1}
 
 def build(source_root:Path,output_dir:Path,tokenizer_path:Path,context_length:int,shard_size:int=50000):
     tokenizer=Tokenizer.from_file(tokenizer_path); output_dir.mkdir(parents=True,exist_ok=True)
     for old in output_dir.glob("*.jsonl"): old.unlink()
-    (output_dir/"manifest.json").unlink(missing_ok=True); (output_dir/"rejections.jsonl").unlink(missing_ok=True)
-    seen=set(); counts=Counter(); sources=Counter(); rejects=Counter(); lengths=Counter(); total_tokens=unk_tokens=0; handles={}; shard_counts=Counter(); rejection_handle=(output_dir/"rejections.jsonl").open("w",encoding="utf-8")
+    for old in (output_dir/"manifest.json",output_dir/"dedup.sqlite3"): old.unlink(missing_ok=True)
+    seen=sqlite3.connect(output_dir/"dedup.sqlite3"); seen.execute("PRAGMA journal_mode=WAL"); seen.execute("CREATE TABLE seen (key BLOB PRIMARY KEY)"); seen.commit()
+    counts=Counter(); sources=Counter(); rejects=Counter(); lengths=Counter(); total_tokens=unk_tokens=0; handles={}; shard_counts=Counter(); rejection_handle=(output_dir/"rejections.jsonl").open("w",encoding="utf-8")
     def handle_for(split):
         index=shard_counts[split]//shard_size; key=(split,index)
         if key not in handles: handles[key]=(output_dir/f"{split}-{index:05d}.jsonl").open("w",encoding="utf-8")
@@ -152,8 +145,7 @@ def build(source_root:Path,output_dir:Path,tokenizer_path:Path,context_length:in
             relative=source_name(str(path.relative_to(source_root)))
             try:
                 suffix=path.suffix.lower()
-                if suffix==".parquet": sources_iter=[(relative,suffix,path)]
-                elif suffix==".xlsx": sources_iter=[(relative,suffix,path)]
+                if suffix in {".parquet",".xlsx"}: sources_iter=[(relative,suffix,path)]
                 elif suffix==".zip": sources_iter=list(iter_archive(path))
                 else: sources_iter=[(relative,suffix,path.read_text(encoding="utf-8",errors="ignore"))]
                 for source,suffix,payload in sources_iter:
@@ -164,21 +156,22 @@ def build(source_root:Path,output_dir:Path,tokenizer_path:Path,context_length:in
                         else: records=parse_source(suffix,payload,source)
                         for record in records:
                             if record is None: rejects["empty_or_invalid"]+=1; continue
-                            key=(record["instruction"].lower(),record["input"].lower(),record["response"].lower())
-                            if key in seen: rejects["duplicate"]+=1; continue
-                            seen.add(key); stats=token_stats(record,tokenizer,context_length); total_tokens+=stats["total_tokens"]; unk_tokens+=stats["unk_tokens"]; lengths["within_context" if stats["fits_context"] else "over_context"]+=1
+                            key_text="\n".join((record["instruction"].lower(),record["input"].lower(),record["response"].lower())); key_hash=hashlib.sha256(key_text.encode()).digest()
+                            inserted=seen.execute("INSERT OR IGNORE INTO seen(key) VALUES (?)",(key_hash,)).rowcount
+                            if not inserted: rejects["duplicate"]+=1; continue
+                            stats=token_stats(record,tokenizer,context_length); total_tokens+=stats["total_tokens"]; unk_tokens+=stats["unk_tokens"]; lengths["within_context" if stats["fits_context"] else "over_context"]+=1
                             if not stats["fits_context"]:
                                 rejects["over_context"]+=1; rejection_handle.write(json.dumps({"reason":"over_context","record":record,"stats":stats},ensure_ascii=False)+"\n"); continue
                             split=split_name(record["id"]); record.update(stats); handle_for(split).write(json.dumps(record,ensure_ascii=False)+"\n"); shard_counts[split]+=1; sources[source]+=1
+                        seen.commit()
                     except Exception as exc:
                         rejects[f"parse_error:{type(exc).__name__}"]+=1; rejection_handle.write(json.dumps({"reason":f"parse_error:{type(exc).__name__}","source":source,"error":str(exc)},ensure_ascii=False)+"\n")
             except Exception as exc:
                 rejects[f"file_error:{type(exc).__name__}"]+=1; rejection_handle.write(json.dumps({"reason":f"file_error:{type(exc).__name__}","source":relative,"error":str(exc)},ensure_ascii=False)+"\n")
     finally:
-        rejection_handle.close()
+        rejection_handle.close(); seen.commit(); seen.close()
         for handle in handles.values(): handle.close()
-    accepted=sum(shard_counts.values())
-    manifest={"source_root":str(source_root),"tokenizer":str(tokenizer_path),"context_length":context_length,"files_or_archive_members_seen":counts["files_or_members"],"unique_records_seen":len(seen),"accepted_records":accepted,"train_records":shard_counts["train"],"validation_records":shard_counts["validation"],"test_records":shard_counts["test"],"rejections":dict(rejects),"length_distribution":dict(lengths),"average_tokens":total_tokens/max(1,len(seen)),"unk_token_rate":unk_tokens/max(1,total_tokens),"source_counts":dict(sources),"split_policy":"stable hash of record id: 90% train, 5% validation, 5% test"}
+    accepted=sum(shard_counts.values()); manifest={"source_root":str(source_root),"tokenizer":str(tokenizer_path),"context_length":context_length,"files_or_archive_members_seen":counts["files_or_members"],"unique_records_seen":sum(shard_counts.values())+rejects["over_context"],"accepted_records":accepted,"train_records":shard_counts["train"],"validation_records":shard_counts["validation"],"test_records":shard_counts["test"],"rejections":dict(rejects),"length_distribution":dict(lengths),"average_tokens":total_tokens/max(1,sum(lengths.values())),"unk_token_rate":unk_tokens/max(1,total_tokens),"source_counts":dict(sources),"split_policy":"stable hash of record id: 90% train, 5% validation, 5% test","deduplication":"disk-backed SQLite SHA-256 key index"}
     (output_dir/"manifest.json").write_text(json.dumps(manifest,indent=2,ensure_ascii=False),encoding="utf-8"); return manifest
 
 def main():

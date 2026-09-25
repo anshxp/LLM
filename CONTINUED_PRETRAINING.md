@@ -96,6 +96,12 @@ Progress is checkpointed every 500 optimizer steps by default, and again at the
 end of every epoch. Therefore a failure can replay at most the work since the
 last progress checkpoint rather than returning to the beginning of the run.
 
+The trainer evaluates both the new validation split and the original
+`data/processed/validation.txt` after every epoch. The original validation loss
+is not used for the new-model checkpoint selection; it is a separate signal for
+checking whether continued pretraining is degrading performance on the original
+foundation distribution.
+
 If you intentionally want to ignore the previous continued-pretraining run and
 start again from the Phase 7 weights, use:
 

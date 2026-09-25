@@ -18,6 +18,36 @@ class CheckpointState(int):
         return self._metadata.get(key, default)
 
 
+def _atomic_torch_save(payload, path: Path) -> None:
+    """Write a checkpoint atomically so interruption cannot corrupt the target."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        torch.save(payload, temporary)
+        temporary.replace(path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _capture_rng_state():
+    state = {"cpu": torch.get_rng_state()}
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state):
+    if not state:
+        return
+    cpu_state = state.get("cpu")
+    if cpu_state is not None:
+        torch.set_rng_state(cpu_state)
+    cuda_state = state.get("cuda")
+    if cuda_state is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda_state)
+
+
 def save_checkpoint(
     model,
     optimizer,
@@ -31,8 +61,6 @@ def save_checkpoint(
 ):
     """Save model and complete training state for reliable resume."""
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
     payload = {
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
@@ -41,11 +69,12 @@ def save_checkpoint(
         "batch_index": batch_index,
         "best_validation_loss": best_validation_loss,
         "epochs_without_improvement": epochs_without_improvement,
+        "rng_state": _capture_rng_state(),
     }
     if scheduler is not None:
         payload["scheduler_state_dict"] = scheduler.state_dict()
 
-    torch.save(payload, path)
+    _atomic_torch_save(payload, path)
 
 
 def load_checkpoint(
@@ -54,6 +83,7 @@ def load_checkpoint(
     path,
     map_location=None,
     scheduler=None,
+    restore_rng=True,
 ):
     """Restore a checkpoint and return its stored training state.
 
@@ -72,6 +102,8 @@ def load_checkpoint(
 
     if scheduler is not None and "scheduler_state_dict" in checkpoint:
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    if restore_rng:
+        _restore_rng_state(checkpoint.get("rng_state"))
 
     return CheckpointState(
         checkpoint["step"],

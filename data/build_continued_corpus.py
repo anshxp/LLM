@@ -19,7 +19,6 @@ from pathlib import Path
 
 from data.cleaner import clean_text
 from data.dedup import is_near_duplicate, simhash
-from data.file_hash import calculate_sha256
 from data.filters import passes_basic_filters
 from data.pdf_extractor import extract_pdf_text
 
@@ -67,7 +66,7 @@ def _normalise_record(record: object) -> str:
     other_parts: list[str] = []
 
     for key, value in record.items():
-        if value is None or key.lower() in SKIP_KEYS:
+        if value is None or str(key).lower() in SKIP_KEYS:
             continue
         if isinstance(value, (dict, list)):
             value_text = json.dumps(value, ensure_ascii=False)
@@ -75,7 +74,8 @@ def _normalise_record(record: object) -> str:
             value_text = str(value).strip()
         if not value_text:
             continue
-        key_lower = key.lower()
+
+        key_lower = str(key).lower()
         if key_lower in QUESTION_KEYS:
             question_parts.append(value_text)
         elif key_lower in ANSWER_KEYS:
@@ -97,97 +97,145 @@ def _normalise_record(record: object) -> str:
     return "\n".join(other_parts)
 
 
-def _records_from_xml(path: Path) -> list[str]:
+def _records_from_xml(path: Path):
     root = ET.parse(path).getroot()
-    records: list[str] = []
     pairs = list(root.iter("QAPair"))
     if pairs:
         for pair in pairs:
             question = (pair.findtext("Question") or "").strip()
             answer = (pair.findtext("Answer") or "").strip()
             if question and answer:
-                records.append(f"Question: {question}\nAnswer: {answer}")
-        return records
+                yield f"Question: {question}\nAnswer: {answer}"
+        return
+
     text = " ".join(t.strip() for t in root.itertext() if t.strip())
-    return [text] if text else []
+    if text:
+        yield text
 
 
-def _records_from_json(path: Path) -> list[str]:
+def _records_from_json(path: Path):
     if path.suffix.lower() == ".jsonl":
-        records = []
         with path.open("r", encoding="utf-8", errors="replace") as handle:
             for line in handle:
                 line = line.strip()
-                if not line:
-                    continue
-                records.append(_normalise_record(json.loads(line)))
-        return records
+                if line:
+                    yield _normalise_record(json.loads(line))
+        return
+
     payload = json.loads(path.read_text(encoding="utf-8", errors="replace"))
     if isinstance(payload, list):
-        return [_normalise_record(item) for item in payload]
-    if isinstance(payload, dict):
+        for item in payload:
+            yield _normalise_record(item)
+    elif isinstance(payload, dict):
         for key in ("data", "records", "examples", "items"):
             if isinstance(payload.get(key), list):
-                return [_normalise_record(item) for item in payload[key]]
-        return [_normalise_record(payload)]
-    return [str(payload)]
+                for item in payload[key]:
+                    yield _normalise_record(item)
+                return
+        yield _normalise_record(payload)
+    else:
+        yield str(payload)
 
 
-def _records_from_delimited(path: Path) -> list[str]:
+def _records_from_delimited(path: Path):
     delimiter = "\t" if path.suffix.lower() == ".tsv" else ","
-    records: list[str] = []
     with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
         for row in csv.DictReader(handle, delimiter=delimiter):
-            records.append(_normalise_record(row))
-    return records
+            yield _normalise_record(row)
 
 
-def _records_from_xlsx(path: Path) -> list[str]:
+def _records_from_xlsx(path: Path):
     from openpyxl import load_workbook
 
     workbook = load_workbook(path, read_only=True, data_only=True)
-    records: list[str] = []
-    for sheet in workbook.worksheets:
-        rows = sheet.iter_rows(values_only=True)
-        try:
-            headers = [str(value).strip() if value is not None else "" for value in next(rows)]
-        except StopIteration:
-            continue
-        for values in rows:
-            record = {headers[i]: values[i] for i in range(min(len(headers), len(values))) if headers[i]}
-            records.append(_normalise_record(record))
-    return records
+    try:
+        for sheet in workbook.worksheets:
+            rows = sheet.iter_rows(values_only=True)
+            try:
+                raw_headers = next(rows)
+            except StopIteration:
+                continue
+            headers = [str(value).strip() if value is not None else "" for value in raw_headers]
+            for values in rows:
+                record = {
+                    headers[i]: values[i]
+                    for i in range(min(len(headers), len(values)))
+                    if headers[i]
+                }
+                yield _normalise_record(record)
+    finally:
+        workbook.close()
 
 
-def _extract_records(path: Path) -> list[str]:
+def _iter_text_documents(path: Path):
+    """Yield bounded text chunks instead of loading a giant file into RAM."""
+    buffer: list[str] = []
+    buffer_chars = 0
+    max_chars = 2_000_000
+
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if not line.strip():
+                if buffer:
+                    yield "".join(buffer)
+                    buffer.clear()
+                    buffer_chars = 0
+                continue
+
+            buffer.append(line)
+            buffer_chars += len(line)
+            if buffer_chars >= max_chars:
+                yield "".join(buffer)
+                buffer.clear()
+                buffer_chars = 0
+
+    if buffer:
+        yield "".join(buffer)
+
+
+def _extract_records(path: Path):
     suffix = path.suffix.lower()
+
     if suffix == ".xml":
-        return _records_from_xml(path)
+        yield from _records_from_xml(path)
+        return
+
     if suffix in {".json", ".jsonl"}:
-        return _records_from_json(path)
+        yield from _records_from_json(path)
+        return
+
     if suffix in {".csv", ".tsv"}:
-        return _records_from_delimited(path)
+        yield from _records_from_delimited(path)
+        return
+
     if suffix == ".xlsx":
-        return _records_from_xlsx(path)
+        yield from _records_from_xlsx(path)
+        return
+
     if suffix == ".pdf":
         text = extract_pdf_text(path)
-        return [text] if text.strip() else []
+        if text.strip():
+            # PDF extraction can return very large strings; chunk before cleaning.
+            for part in re.split(r"\n\s*\n+", text):
+                if part.strip():
+                    yield part
+        return
+
     if suffix in SUPPORTED_TEXT:
-        text = path.read_text(encoding="utf-8", errors="replace")
-        # Existing processed corpora and plain text often contain document
-        # boundaries separated by blank lines. Preserve those as documents.
-        return [part for part in re.split(r"\n\s*\n+", text) if part.strip()]
-    return []
+        yield from _iter_text_documents(path)
+        return
 
 
 def _iter_source_files(root: Path):
     _assert_allowed_path(root)
     if not root.exists():
         raise FileNotFoundError(f"Source directory not found: {root}")
+
     if root.is_file():
         if root.suffix.lower() in SUPPORTED:
             yield root
         return
+
     for path in sorted(root.rglob("*")):
         if path.is_file() and path.suffix.lower() in SUPPORTED:
             _assert_allowed_path(path)
@@ -199,15 +247,15 @@ def _iter_clean_documents(sources: list[Path], old_train: Path):
     if not old_train.exists():
         raise FileNotFoundError(f"Original processed training corpus not found: {old_train}")
 
-    # The old corpus is already cleaned and split. We use only train.txt here;
-    # data/raw is never consulted.
-    for index, text in enumerate(_extract_records(old_train)):
+    # Old corpus is already processed; only train.txt is intentionally reused.
+    for index, text in enumerate(_iter_text_documents(old_train)):
         yield f"old-train:{index}", clean_text(text)
 
     for source in sources:
         for path in _iter_source_files(source):
             for index, text in enumerate(_extract_records(path)):
-                yield f"new:{path}:{index}", clean_text(text)
+                if text:
+                    yield f"new:{path}:{index}", clean_text(text)
 
 
 def build_corpus(sources: list[Path], old_train: Path, output_dir: Path) -> dict:
@@ -217,6 +265,7 @@ def build_corpus(sources: list[Path], old_train: Path, output_dir: Path) -> dict
         for split in ("train", "validation", "test")
     }
     manifest_path = output_dir / "manifest.jsonl"
+
     stats = {
         "old_train_documents": 0,
         "source_files": 0,
@@ -229,27 +278,35 @@ def build_corpus(sources: list[Path], old_train: Path, output_dir: Path) -> dict
         "validation_documents": 0,
         "test_documents": 0,
     }
+
     seen_hashes: set[str] = set()
     seen_simhashes: list[int] = []
 
     try:
         with manifest_path.open("w", encoding="utf-8") as manifest:
+            current_source = None
+
             for source_id, raw_text in _iter_clean_documents(sources, old_train):
                 if source_id.startswith("old-train:"):
                     stats["old_train_documents"] += 1
                 else:
-                    if source_id.rsplit(":", 1)[-1] == "0":
+                    source_name = source_id.rsplit(":", 1)[0]
+                    if source_name != current_source:
+                        current_source = source_name
                         stats["source_files"] += 1
+
                 try:
-                    cleaned = clean_text(raw_text)
+                    cleaned = raw_text
                     if not passes_basic_filters(cleaned):
                         stats["rejected"] += 1
                         continue
+
                     content_hash = _content_hash(cleaned)
                     if content_hash in seen_hashes:
                         stats["duplicates"] += 1
                         continue
                     seen_hashes.add(content_hash)
+
                     fingerprint = simhash(cleaned)
                     if is_near_duplicate(fingerprint, seen_simhashes):
                         stats["near_duplicates"] += 1
@@ -260,9 +317,11 @@ def build_corpus(sources: list[Path], old_train: Path, output_dir: Path) -> dict
                     print(f"Failed to process {source_id}: {exc}")
                     continue
 
-                # Keep the existing foundation corpus in training only. New
-                # sources receive the deterministic 90/5/5 split.
-                split = "train" if source_id.startswith("old-train:") else _split_for_hash(content_hash)
+                split = (
+                    "train"
+                    if source_id.startswith("old-train:")
+                    else _split_for_hash(content_hash)
+                )
                 output_files[split].write(cleaned + "\n\n")
                 stats[f"{split}_documents"] += 1
                 stats["accepted"] += 1
@@ -288,6 +347,7 @@ def main(args=None):
     parsed = parser.parse_args(args)
     sources = parsed.sources or list(DEFAULT_SOURCES)
     stats = build_corpus(sources, parsed.old_train, parsed.output_dir)
+
     print("\nContinued-pretraining corpus build complete")
     for key, value in stats.items():
         print(f"{key}: {value}")

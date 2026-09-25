@@ -7,6 +7,10 @@ The builder intentionally uses only:
 
 It never scans data/ or data/raw recursively, so the original raw pretraining
 sources cannot accidentally be re-ingested.
+
+The builder is deliberately verbose: it logs discovery, extraction, filtering,
+deduplication, output progress, and final statistics so a long build can be
+inspected from the terminal without guessing what happened.
 """
 
 import argparse
@@ -14,6 +18,8 @@ import csv
 import hashlib
 import json
 import re
+import time
+import unicodedata
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -33,6 +39,13 @@ QUESTION_KEYS = {"question", "prompt", "instruction", "query", "user"}
 ANSWER_KEYS = {"answer", "response", "output", "completion", "assistant"}
 TEXT_KEYS = {"text", "content", "body"}
 SKIP_KEYS = {"id", "source", "url", "metadata", "index", "uuid"}
+
+VERBOSE_EVERY_DOCUMENTS = 100
+PROGRESS_EVERY_BYTES = 64 * 1024 * 1024
+
+
+def _log(message: str) -> None:
+    print(f"[corpus] {message}", flush=True)
 
 
 def _content_hash(text: str) -> str:
@@ -215,7 +228,6 @@ def _extract_records(path: Path):
     if suffix == ".pdf":
         text = extract_pdf_text(path)
         if text.strip():
-            # PDF extraction can return very large strings; chunk before cleaning.
             for part in re.split(r"\n\s*\n+", text):
                 if part.strip():
                     yield part
@@ -234,12 +246,51 @@ def _iter_source_files(root: Path):
     if root.is_file():
         if root.suffix.lower() in SUPPORTED:
             yield root
+        else:
+            _log(f"SKIP unsupported source file: {root}")
         return
 
-    for path in sorted(root.rglob("*")):
+    files = sorted(root.rglob("*"))
+    total_files = sum(path.is_file() for path in files)
+    supported_files = sum(path.is_file() and path.suffix.lower() in SUPPORTED for path in files)
+    unsupported_files = total_files - supported_files
+    total_bytes = sum(path.stat().st_size for path in files if path.is_file())
+    supported_bytes = sum(path.stat().st_size for path in files if path.is_file() and path.suffix.lower() in SUPPORTED)
+
+    _log(f"SOURCE SCAN: {root}")
+    _log(f"  files found       : {total_files:,}")
+    _log(f"  supported files   : {supported_files:,}")
+    _log(f"  unsupported files : {unsupported_files:,}")
+    _log(f"  total disk size   : {total_bytes / (1024**3):.3f} GiB")
+    _log(f"  supported size    : {supported_bytes / (1024**3):.3f} GiB")
+
+    if unsupported_files:
+        _log("  unsupported extensions:")
+        counts: dict[str, tuple[int, int]] = {}
+        for path in files:
+            if path.is_file() and path.suffix.lower() not in SUPPORTED:
+                ext = path.suffix.lower() or "<no extension>"
+                old_count, old_bytes = counts.get(ext, (0, 0))
+                counts[ext] = (old_count + 1, old_bytes + path.stat().st_size)
+        for ext, (count, size) in sorted(counts.items(), key=lambda item: item[1][1], reverse=True):
+            _log(f"    {ext}: {count:,} files, {size / (1024**3):.3f} GiB")
+
+    for path in files:
         if path.is_file() and path.suffix.lower() in SUPPORTED:
             _assert_allowed_path(path)
             yield path
+
+
+def _clean_text_with_repair(text: str) -> str:
+    """Clean text and repair common UTF-8-as-Windows-1252 mojibake when detected."""
+    if "â" in text or "Ã" in text or "Â" in text:
+        try:
+            repaired = text.encode("latin1").decode("utf-8")
+            if sum(ord(c) > 127 for c in repaired) >= sum(ord(c) > 127 for c in text):
+                text = repaired
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+    return clean_text(text)
 
 
 def _iter_clean_documents(sources: list[Path], old_train: Path):
@@ -247,19 +298,56 @@ def _iter_clean_documents(sources: list[Path], old_train: Path):
     if not old_train.exists():
         raise FileNotFoundError(f"Original processed training corpus not found: {old_train}")
 
-    # Old corpus is already processed; only train.txt is intentionally reused.
+    _log(f"OLD CORPUS: {old_train}")
+    old_size = old_train.stat().st_size
+    _log(f"  disk size: {old_size / (1024**2):.2f} MiB")
+    _log("  processing already-prepared train.txt...")
     for index, text in enumerate(_iter_text_documents(old_train)):
-        yield f"old-train:{index}", clean_text(text)
+        yield f"old-train:{index}", _clean_text_with_repair(text)
 
     for source in sources:
+        _log(f"BEGIN SOURCE: {source}")
+        file_number = 0
         for path in _iter_source_files(source):
-            for index, text in enumerate(_extract_records(path)):
-                if text:
-                    yield f"new:{path}:{index}", clean_text(text)
+            file_number += 1
+            file_size = path.stat().st_size
+            _log(f"FILE {file_number}: {path} | {file_size / (1024**2):.2f} MiB | {path.suffix.lower()}")
+            try:
+                record_count = 0
+                for index, text in enumerate(_extract_records(path)):
+                    if text:
+                        record_count += 1
+                        yield f"new:{path}:{index}", _clean_text_with_repair(text)
+                _log(f"  extracted records/chunks: {record_count:,}")
+            except Exception as exc:
+                _log(f"  EXTRACTION FAILURE: {type(exc).__name__}: {exc}")
+                yield f"__EXTRACTION_FAILURE__:{path}", ""
+        _log(f"END SOURCE: {source} | processed files: {file_number:,}")
 
 
 def build_corpus(sources: list[Path], old_train: Path, output_dir: Path) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
+    _log("=" * 72)
+    _log("CONTINUED PRETRAINING CORPUS BUILD")
+    _log("=" * 72)
+    _log(f"Old corpus       : {old_train}")
+    _log(f"New sources      : {', '.join(map(str, sources))}")
+    _log(f"Output directory : {output_dir}")
+    _log("EXPLICIT EXCLUSION: data/raw will NOT be read")
+    _log(f"Supported formats: {', '.join(sorted(SUPPORTED))}")
+
+    for source in sources:
+        _assert_allowed_path(source)
+    _assert_allowed_path(old_train)
+
+    # Remove previous generated outputs so a failed/interrupted build cannot leave
+    # a misleading mixture of old and new data.
+    for name in ("train.txt", "validation.txt", "test.txt", "manifest.jsonl"):
+        target = output_dir / name
+        if target.exists():
+            _log(f"REMOVE OLD OUTPUT: {target} ({target.stat().st_size / (1024**2):.2f} MiB)")
+            target.unlink()
+
     output_files = {
         split: (output_dir / f"{split}.txt").open("w", encoding="utf-8")
         for split in ("train", "validation", "test")
@@ -269,6 +357,7 @@ def build_corpus(sources: list[Path], old_train: Path, output_dir: Path) -> dict
     stats = {
         "old_train_documents": 0,
         "source_files": 0,
+        "source_records": 0,
         "accepted": 0,
         "rejected": 0,
         "duplicates": 0,
@@ -277,19 +366,29 @@ def build_corpus(sources: list[Path], old_train: Path, output_dir: Path) -> dict
         "train_documents": 0,
         "validation_documents": 0,
         "test_documents": 0,
+        "accepted_chars": 0,
     }
 
     seen_hashes: set[str] = set()
     seen_simhashes: list[int] = []
+    start = time.time()
+    last_progress_bytes = 0
+    processed_documents = 0
 
     try:
         with manifest_path.open("w", encoding="utf-8") as manifest:
             current_source = None
 
             for source_id, raw_text in _iter_clean_documents(sources, old_train):
+                processed_documents += 1
+                if source_id.startswith("__EXTRACTION_FAILURE__:"):
+                    stats["extraction_failures"] += 1
+                    continue
+
                 if source_id.startswith("old-train:"):
                     stats["old_train_documents"] += 1
                 else:
+                    stats["source_records"] += 1
                     source_name = source_id.rsplit(":", 1)[0]
                     if source_name != current_source:
                         current_source = source_name
@@ -299,32 +398,35 @@ def build_corpus(sources: list[Path], old_train: Path, output_dir: Path) -> dict
                     cleaned = raw_text
                     if not passes_basic_filters(cleaned):
                         stats["rejected"] += 1
+                        if processed_documents <= 20:
+                            _log(f"REJECT FILTER: {source_id}")
                         continue
 
                     content_hash = _content_hash(cleaned)
                     if content_hash in seen_hashes:
                         stats["duplicates"] += 1
+                        if processed_documents <= 20:
+                            _log(f"REJECT DUPLICATE: {source_id}")
                         continue
                     seen_hashes.add(content_hash)
 
                     fingerprint = simhash(cleaned)
                     if is_near_duplicate(fingerprint, seen_simhashes):
                         stats["near_duplicates"] += 1
+                        if processed_documents <= 20:
+                            _log(f"REJECT NEAR-DUPLICATE: {source_id}")
                         continue
                     seen_simhashes.append(fingerprint)
                 except Exception as exc:
                     stats["extraction_failures"] += 1
-                    print(f"Failed to process {source_id}: {exc}")
+                    _log(f"PROCESSING FAILURE: {source_id}: {type(exc).__name__}: {exc}")
                     continue
 
-                split = (
-                    "train"
-                    if source_id.startswith("old-train:")
-                    else _split_for_hash(content_hash)
-                )
+                split = "train" if source_id.startswith("old-train:") else _split_for_hash(content_hash)
                 output_files[split].write(cleaned + "\n\n")
                 stats[f"{split}_documents"] += 1
                 stats["accepted"] += 1
+                stats["accepted_chars"] += len(cleaned)
                 manifest.write(
                     json.dumps(
                         {"source": source_id, "content_sha256": content_hash, "split": split},
@@ -332,26 +434,60 @@ def build_corpus(sources: list[Path], old_train: Path, output_dir: Path) -> dict
                     )
                     + "\n"
                 )
+
+                if processed_documents <= 20 or processed_documents % VERBOSE_EVERY_DOCUMENTS == 0:
+                    elapsed = max(time.time() - start, 0.001)
+                    _log(
+                        f"PROGRESS docs={processed_documents:,} accepted={stats['accepted']:,} "
+                        f"rejected={stats['rejected']:,} dup={stats['duplicates']:,} "
+                        f"near_dup={stats['near_duplicates']:,} "
+                        f"accepted_text={stats['accepted_chars'] / (1024**2):.2f} MiB "
+                        f"rate={processed_documents / elapsed:.1f} docs/s"
+                    )
+
+                output_size = sum(
+                    (output_dir / f"{split}.txt").stat().st_size
+                    for split in ("train", "validation", "test")
+                )
+                if output_size - last_progress_bytes >= PROGRESS_EVERY_BYTES:
+                    last_progress_bytes = output_size
+                    _log(f"OUTPUT SIZE: {output_size / (1024**2):.2f} MiB")
     finally:
         for handle in output_files.values():
             handle.close()
 
+    elapsed = max(time.time() - start, 0.001)
+    stats["elapsed_seconds"] = round(elapsed, 2)
+    stats["output_bytes"] = sum(
+        (output_dir / f"{split}.txt").stat().st_size
+        for split in ("train", "validation", "test")
+    )
+
+    _log("=" * 72)
+    _log("BUILD COMPLETE")
+    _log("=" * 72)
+    for key, value in stats.items():
+        if key.endswith("_seconds"):
+            _log(f"{key:24s}: {value}")
+        elif key.endswith("_bytes"):
+            _log(f"{key:24s}: {value / (1024**2):.2f} MiB")
+        elif key == "accepted_chars":
+            _log(f"{key:24s}: {value:,} chars ({value / (1024**2):.2f} MiB UTF-8 approx.)")
+        else:
+            _log(f"{key:24s}: {value:,}")
+    _log(f"Output directory: {output_dir.resolve()}")
+    _log("=" * 72)
     return stats
 
 
 def main(args=None):
-    parser = argparse.ArgumentParser(description="Build the continued-pretraining corpus.")
+    parser = argparse.ArgumentParser(description="Build the continued-pretraining corpus with verbose logging.")
     parser.add_argument("--source", dest="sources", action="append", type=Path)
     parser.add_argument("--old-train", type=Path, default=DEFAULT_OLD_TRAIN)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parsed = parser.parse_args(args)
     sources = parsed.sources or list(DEFAULT_SOURCES)
-    stats = build_corpus(sources, parsed.old_train, parsed.output_dir)
-
-    print("\nContinued-pretraining corpus build complete")
-    for key, value in stats.items():
-        print(f"{key}: {value}")
-    print(f"Output: {parsed.output_dir}")
+    build_corpus(sources, parsed.old_train, parsed.output_dir)
 
 
 if __name__ == "__main__":

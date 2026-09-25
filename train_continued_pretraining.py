@@ -23,6 +23,7 @@ from training.optimizer import create_optimizer
 
 DEFAULT_PRETRAIN_CHECKPOINT = Path("checkpoints/phase7_run/best_model.pt")
 DEFAULT_CORPUS_DIR = Path("data/processed/continued_pretraining")
+DEFAULT_OLD_VALIDATION = Path("data/processed/validation.txt")
 DEFAULT_CHECKPOINT_DIR = Path("checkpoints/continued_pretraining")
 DEFAULT_BATCH_SIZE = 1
 DEFAULT_GRADIENT_ACCUMULATION = 4
@@ -43,6 +44,7 @@ def parse_args(args=None):
     )
     parser.add_argument("--pretrained-checkpoint", type=Path, default=DEFAULT_PRETRAIN_CHECKPOINT)
     parser.add_argument("--corpus-dir", type=Path, default=DEFAULT_CORPUS_DIR)
+    parser.add_argument("--old-validation", type=Path, default=DEFAULT_OLD_VALIDATION)
     parser.add_argument("--checkpoint-dir", type=Path, default=DEFAULT_CHECKPOINT_DIR)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=DEFAULT_GRADIENT_ACCUMULATION)
@@ -99,9 +101,13 @@ def resolve_device(requested):
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def _load_dataset(corpus_dir: Path, split: str, context_length: int, stride: int):
-    token_ids = load_token_ids_from_file(corpus_dir / f"{split}.txt")
+def _load_dataset_from_file(path: Path, context_length: int, stride: int):
+    token_ids = load_token_ids_from_file(path)
     return LanguageModelDataset(token_ids, context_length=context_length, stride=stride)
+
+
+def _load_dataset(corpus_dir: Path, split: str, context_length: int, stride: int):
+    return _load_dataset_from_file(corpus_dir / f"{split}.txt", context_length, stride)
 
 
 def _load_pretrained_weights(model, path: Path, device):
@@ -124,25 +130,23 @@ def main(args=None):
     corpus_dir = args.corpus_dir
     train_dataset = _load_dataset(corpus_dir, "train", config.context_length, args.train_stride)
     validation_dataset = _load_dataset(corpus_dir, "validation", config.context_length, args.eval_stride)
-    if len(train_dataset) == 0 or len(validation_dataset) == 0:
-        raise ValueError("Training and validation splits must contain complete sequences")
+    old_validation_dataset = _load_dataset_from_file(
+        args.old_validation, config.context_length, args.eval_stride
+    )
+    if len(train_dataset) == 0 or len(validation_dataset) == 0 or len(old_validation_dataset) == 0:
+        raise ValueError("All training and validation splits must contain complete sequences")
 
     # Sequential ordering is deliberate. It makes batch_index in the checkpoint
     # an exact resume cursor instead of depending on DataLoader shuffle state.
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
-    )
-    validation_loader = DataLoader(
-        validation_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
-    )
+    loader_kwargs = {
+        "batch_size": args.batch_size,
+        "shuffle": False,
+        "num_workers": args.num_workers,
+        "pin_memory": torch.cuda.is_available(),
+    }
+    train_loader = DataLoader(train_dataset, **loader_kwargs)
+    validation_loader = DataLoader(validation_dataset, **loader_kwargs)
+    old_validation_loader = DataLoader(old_validation_dataset, **loader_kwargs)
 
     model = LLM(config).to(device)
     optimizer = create_optimizer(
@@ -192,7 +196,8 @@ def main(args=None):
 
     print(
         f"Dataset: continued_pretraining | train={len(train_dataset):,} | "
-        f"validation={len(validation_dataset):,}"
+        f"new_validation={len(validation_dataset):,} | "
+        f"old_validation={len(old_validation_dataset):,}"
     )
     print(f"Device: {device} | Parameters: {sum(p.numel() for p in model.parameters()):,}")
     print(f"Checkpoint directory: {args.checkpoint_dir}")
@@ -254,10 +259,15 @@ def main(args=None):
                     print(f"Progress checkpoint saved: {latest_path}")
 
         metrics = evaluate(model, validation_loader, device=device)
+        old_metrics = evaluate(model, old_validation_loader, device=device)
         validation_loss = metrics["loss"]
         print(
-            f"Validation loss: {validation_loss:.4f} | "
+            f"New validation loss: {validation_loss:.4f} | "
             f"Perplexity: {metrics['perplexity']:.2f}"
+        )
+        print(
+            f"Original validation loss: {old_metrics['loss']:.4f} | "
+            f"Perplexity: {old_metrics['perplexity']:.2f}"
         )
         improved = validation_loss < best_validation_loss
         if improved:

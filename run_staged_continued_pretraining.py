@@ -1,12 +1,11 @@
 """Run the exact staged workflow: build one corpus shard, train it, repeat.
 
 For every shard the runner performs:
-
 1. obtain one local seed or one Hugging Face Parquet file;
 2. build its processed train/validation corpus on disk;
 3. train from the previous checkpoint;
 4. save a shard checkpoint;
-5. delete the temporary remote source and processed corpus;
+5. delete temporary remote data and processed corpus after successful training;
 6. continue with the next shard.
 
 The persistent dedup database is shared across all shards.
@@ -110,6 +109,7 @@ def main(args=None):
 
         source_path = None
         prepared_dir = options.work_dir / f"shard_{index:05d}"
+        success = False
         try:
             if kind == "hf":
                 download_dir = options.work_dir / f"download_{index:05d}"
@@ -137,29 +137,31 @@ def main(args=None):
                     ]
                 )
 
+            train_args = [
+                "--prepared-dir", str(prepared_dir),
+                "--pretrained-checkpoint", str(options.pretrained_checkpoint),
+                "--tokenizer", str(options.tokenizer),
+                "--checkpoint-dir", str(options.checkpoint_dir),
+                "--shard-index", str(index),
+                "--shard-name", name,
+                "--batch-size", str(options.batch_size),
+                "--gradient-accumulation-steps", str(options.gradient_accumulation_steps),
+                "--learning-rate", str(options.learning_rate),
+                "--weight-decay", str(options.weight_decay),
+                "--checkpoint-every-steps", str(options.checkpoint_every_steps),
+                "--log-every", str(options.log_every),
+                "--max-grad-norm", str(options.max_grad_norm),
+                "--device", options.device,
+                "--num-workers", str(options.num_workers),
+            ]
+            if options.reset_run and index == 0:
+                train_args.append("--reset-run")
+
             print(f"Training shard {index}: {name}")
-            train_shard(
-                [
-                    "--prepared-dir", str(prepared_dir),
-                    "--pretrained-checkpoint", str(options.pretrained_checkpoint),
-                    "--tokenizer", str(options.tokenizer),
-                    "--checkpoint-dir", str(options.checkpoint_dir),
-                    "--shard-index", str(index),
-                    "--shard-name", name,
-                    "--batch-size", str(options.batch_size),
-                    "--gradient-accumulation-steps", str(options.gradient_accumulation_steps),
-                    "--learning-rate", str(options.learning_rate),
-                    "--weight-decay", str(options.weight_decay),
-                    "--checkpoint-every-steps", str(options.checkpoint_every_steps),
-                    "--log-every", str(options.log_every),
-                    "--max-grad-norm", str(options.max_grad_norm),
-                    "--device", options.device,
-                    "--num-workers", str(options.num_workers),
-                    "--reset-run" if options.reset_run and index == 0 else "--reset-run-do-not-use",
-                ]
-            )
+            train_shard(train_args)
+            success = True
         finally:
-            if prepared_dir.exists():
+            if success and prepared_dir.exists():
                 shutil.rmtree(prepared_dir, ignore_errors=True)
             if source_path is not None and kind == "hf":
                 download_dir = source_path.parent

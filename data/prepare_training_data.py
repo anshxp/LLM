@@ -26,28 +26,22 @@ BASE_SPLIT_FILES = SPLIT_FILES["base"]
 CORPUS_FILE = BASE_SPLIT_FILES["train"]
 
 
-def load_token_ids_from_file(corpus_file: Path, tokenizer_file: Path = TOKENIZER_FILE):
+def load_token_ids_from_file(corpus_file: Path, tokenizer_file=None):
     """Tokenize one already-built corpus file with the project tokenizer."""
     config = ModelConfig()
-    tokenizer = Tokenizer.from_file(tokenizer_file)
 
-    if len(tokenizer) != config.vocab_size:
-        raise ValueError(
-            f"Tokenizer vocabulary ({len(tokenizer)}) does not match "
-            f"model vocabulary ({config.vocab_size})"
-        )
-    corpus_file = Path(corpus_file)
-    if not corpus_file.exists():
-        raise FileNotFoundError(f"Corpus split not found: {corpus_file}")
+    tokenizer_path = (
+        Path(tokenizer_file)
+        if tokenizer_file is not None
+        else TOKENIZER_FILE
+    )
 
-    text = corpus_file.read_text(encoding="utf-8", errors="replace")
-    token_ids = tokenizer.encode(text)
-    if len(token_ids) <= config.context_length:
-        raise ValueError(
-            f"{corpus_file} does not contain enough tokens for the configured "
-            f"context length ({config.context_length})."
+    if not tokenizer_path.exists():
+        raise FileNotFoundError(
+            f"Tokenizer file not found: {tokenizer_path}"
         )
-    return token_ids
+
+    tokenizer = Tokenizer.from_file(tokenizer_path)
 
 
 def load_token_ids(split: str = "train", dataset: str = "base"):

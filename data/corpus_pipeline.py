@@ -1,12 +1,4 @@
-"""Storage-efficient corpus pipeline for v2 pretraining.
-
-Repository layout is fixed:
-    data/raw/             all pretraining sources
-    data/Fine tuning 2/   supervised fine-tuning sources (not built here)
-
-Pretraining streams directly from data/raw. Large Parquet shards are processed
-one at a time and no processed copy of the corpus is created.
-"""
+"""Storage-efficient streaming corpus pipeline for v2 pretraining."""
 from __future__ import annotations
 
 import argparse
@@ -19,16 +11,14 @@ from typing import Iterator
 from data.cleaner import clean_text
 from data.dedup import is_near_duplicate, simhash
 from data.filters import passes_basic_filters
-from data.pdf_extractor import extract_pdf_text
+from data.pdf_extractor import iter_pdf_paragraphs
 
 PRETRAIN_ROOT = Path("data/raw")
-SFT_ROOT = Path("data/Fine tuning 2")
-SUPPORTED_TEXT = {".txt", ".md", ".markdown"}
+SUPPORTED_TEXT = {".txt", ".text", ".md", ".markdown"}
 SUPPORTED = SUPPORTED_TEXT | {".pdf", ".parquet"}
 
 
 def list_pretraining_shards(source_root: Path = PRETRAIN_ROOT) -> list[Path]:
-    """Return deterministic pretraining files; each file is a resumable unit."""
     paths = sorted(
         p for p in Path(source_root).rglob("*")
         if p.is_file() and p.suffix.lower() in SUPPORTED
@@ -38,8 +28,20 @@ def list_pretraining_shards(source_root: Path = PRETRAIN_ROOT) -> list[Path]:
     return paths
 
 
+def _as_text(value) -> Iterator[str]:
+    """Handle BlueScrubs rows stored as either string or list-of-strings."""
+    if value is None:
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            if item is not None:
+                yield str(item)
+    else:
+        yield str(value)
+
+
 def _iter_parquet_text(path: Path) -> Iterator[str]:
-    """Yield only the text column in small Arrow batches."""
+    """Stream only the text column in small Arrow batches."""
     import pyarrow.parquet as pq
 
     parquet = pq.ParquetFile(path)
@@ -47,19 +49,24 @@ def _iter_parquet_text(path: Path) -> Iterator[str]:
         raise ValueError(f"Parquet pretraining file has no 'text' column: {path}")
     for batch in parquet.iter_batches(batch_size=128, columns=["text"]):
         for value in batch.column(0).to_pylist():
-            if value is not None:
-                yield str(value)
+            yield from _as_text(value)
 
 
 def iter_shard_text(path: Path) -> Iterator[str]:
     """Stream one raw shard at a time with bounded memory."""
-    if path.suffix.lower() == ".parquet":
+    suffix = path.suffix.lower()
+    if suffix == ".parquet":
         source = _iter_parquet_text(path)
-    elif path.suffix.lower() == ".pdf":
-        yield clean_text(extract_pdf_text(path))
+    elif suffix == ".pdf":
+        for paragraph in iter_pdf_paragraphs(path):
+            text = clean_text(paragraph)
+            if passes_basic_filters(text):
+                yield text
         return
     else:
-        yield clean_text(path.read_text(encoding="utf-8", errors="replace"))
+        text = clean_text(path.read_text(encoding="utf-8", errors="replace"))
+        if passes_basic_filters(text):
+            yield text
         return
 
     for text in source:
@@ -69,16 +76,13 @@ def iter_shard_text(path: Path) -> Iterator[str]:
 
 
 def iter_pretraining_text(source_root: Path = PRETRAIN_ROOT) -> Iterator[tuple[str, str]]:
-    """Stream all pretraining documents without creating a processed corpus."""
     source_root = Path(source_root)
     for path in list_pretraining_shards(source_root):
         for text in iter_shard_text(path):
-            if passes_basic_filters(text):
-                yield text, str(path.relative_to(source_root))
+            yield text, str(path.relative_to(source_root))
 
 
 def iter_pretraining_shards(source_root: Path = PRETRAIN_ROOT) -> Iterator[tuple[str, Iterator[str]]]:
-    """Yield (relative shard name, document iterator) one shard at a time."""
     source_root = Path(source_root)
     for path in list_pretraining_shards(source_root):
         yield str(path.relative_to(source_root)), iter_shard_text(path)
@@ -88,12 +92,20 @@ def build_pretraining_manifest(
     source_root: Path = PRETRAIN_ROOT,
     manifest_path: Path = Path("data/processed/v2/pretrain_manifest.jsonl"),
 ) -> dict:
-    """Create only tiny metadata; raw training text stays in data/raw."""
+    """Create compact metadata; the raw 57GB corpus is never copied."""
     source_root = Path(source_root).resolve()
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     db_path = manifest_path.parent / ".pretrain_dedup.sqlite3"
     seen_near: list[int] = []
-    stats = {"files": 0, "documents_seen": 0, "accepted": 0, "rejected": 0, "duplicates": 0, "near_duplicates": 0}
+    stats = {
+        "files": 0,
+        "documents_seen": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "duplicates": 0,
+        "near_duplicates": 0,
+        "extraction_failures": 0,
+    }
 
     db = sqlite3.connect(db_path)
     db.execute("CREATE TABLE IF NOT EXISTS seen (sha256 BLOB PRIMARY KEY)")
@@ -102,21 +114,30 @@ def build_pretraining_manifest(
         with manifest_path.open("w", encoding="utf-8") as manifest:
             for source, documents in iter_pretraining_shards(source_root):
                 stats["files"] += 1
-                for text in documents:
-                    stats["documents_seen"] += 1
-                    normalized = " ".join(text.split())
-                    digest = hashlib.sha256(normalized.encode("utf-8")).digest()
-                    if not db.execute("INSERT OR IGNORE INTO seen VALUES (?)", (digest,)).rowcount:
-                        stats["duplicates"] += 1
-                        continue
-                    if source.lower().endswith((".txt", ".md", ".markdown", ".pdf")):
-                        fingerprint = simhash(text)
-                        if is_near_duplicate(fingerprint, seen_near):
-                            stats["near_duplicates"] += 1
+                try:
+                    for text in documents:
+                        stats["documents_seen"] += 1
+                        normalized = " ".join(text.split())
+                        digest = hashlib.sha256(normalized.encode("utf-8")).digest()
+                        if not db.execute("INSERT OR IGNORE INTO seen VALUES (?)", (digest,)).rowcount:
+                            stats["duplicates"] += 1
                             continue
-                        seen_near.append(fingerprint)
-                    manifest.write(json.dumps({"source": source, "sha256": digest.hex(), "characters": len(text)}, ensure_ascii=False) + "\n")
-                    stats["accepted"] += 1
+                        if source.lower().endswith((".txt", ".text", ".md", ".markdown", ".pdf")):
+                            fingerprint = simhash(text)
+                            if is_near_duplicate(fingerprint, seen_near):
+                                stats["near_duplicates"] += 1
+                                continue
+                            seen_near.append(fingerprint)
+                        manifest.write(
+                            json.dumps(
+                                {"source": source, "sha256": digest.hex(), "characters": len(text)},
+                                ensure_ascii=False,
+                            ) + "\n"
+                        )
+                        stats["accepted"] += 1
+                except Exception as exc:
+                    stats["extraction_failures"] += 1
+                    print(f"Skipped unreadable shard: {source}: {exc}")
             db.commit()
     finally:
         db.close()
@@ -128,12 +149,11 @@ def build_pretraining_manifest(
 
 
 def build_sft(*_args, **_kwargs):
-    """SFT is disabled until the user explicitly starts the SFT phase."""
     raise RuntimeError("SFT is disabled during pretraining. Start SFT explicitly after pretraining.")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Prepare tiny metadata for streaming v2 pretraining.")
+    parser = argparse.ArgumentParser(description="Build compact metadata for streaming v2 pretraining.")
     parser.add_argument("--output-root", type=Path, default=Path("data/processed/v2"))
     args = parser.parse_args()
     if not PRETRAIN_ROOT.is_dir():

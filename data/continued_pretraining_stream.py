@@ -273,11 +273,13 @@ def download_hf_shard(
 class ExactDedupStore:
     """Disk-backed exact deduplication so 57GB never requires a RAM-sized set."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, commit_every: int = 10_000):
         import sqlite3
 
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.commit_every = max(1, commit_every)
+        self.pending = 0
         self.connection = sqlite3.connect(self.path)
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA synchronous=NORMAL")
@@ -291,10 +293,15 @@ class ExactDedupStore:
         inserted = self.connection.execute(
             "INSERT OR IGNORE INTO seen(content_sha256) VALUES (?)", (digest,)
         ).rowcount
+        self.pending += 1
+        if self.pending >= self.commit_every:
+            self.connection.commit()
+            self.pending = 0
         return bool(inserted)
 
     def commit(self) -> None:
         self.connection.commit()
+        self.pending = 0
 
     def close(self) -> None:
         self.connection.commit()

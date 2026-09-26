@@ -18,7 +18,7 @@ from pathlib import Path
 
 import torch
 
-from data.build_continued_shard import main as build_shard
+from data.build_continued_shard import COMPLETE_MARKER, main as build_shard
 from data.continued_pretraining_stream import download_hf_shard, hf_parquet_files
 from train_prepared_continued_pretraining import main as train_shard
 
@@ -124,8 +124,9 @@ def main(args=None):
             else:
                 source_path = Path(payload)
 
-            if prepared_dir.exists():
-                print(f"Prepared corpus already exists; reusing: {prepared_dir}")
+            marker = prepared_dir / COMPLETE_MARKER
+            if marker.exists():
+                print(f"Prepared corpus already complete; reusing: {prepared_dir}")
             else:
                 print(f"Building corpus for shard {index}: {name}")
                 build_shard(

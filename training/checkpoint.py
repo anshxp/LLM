@@ -58,8 +58,13 @@ def save_checkpoint(
     scheduler=None,
     best_validation_loss=None,
     epochs_without_improvement=0,
+    extra_state=None,
 ):
-    """Save model and complete training state for reliable resume."""
+    """Save model and complete training state for reliable resume.
+
+    ``extra_state`` lets shard-based trainers persist the current shard and
+    other run metadata without changing the contract for older callers.
+    """
     path = Path(path)
     payload = {
         "model_state_dict": model.state_dict(),
@@ -73,6 +78,8 @@ def save_checkpoint(
     }
     if scheduler is not None:
         payload["scheduler_state_dict"] = scheduler.state_dict()
+    if extra_state:
+        payload.update(dict(extra_state))
 
     _atomic_torch_save(payload, path)
 
@@ -89,7 +96,7 @@ def load_checkpoint(
 
     The returned object remains integer-compatible for legacy callers that
     compared the return value directly with the optimizer step, while also
-    exposing the full resume metadata through mapping-style access.
+    exposing full resume metadata through mapping-style access.
     """
     checkpoint = torch.load(
         Path(path),
@@ -105,12 +112,14 @@ def load_checkpoint(
     if restore_rng:
         _restore_rng_state(checkpoint.get("rng_state"))
 
-    return CheckpointState(
-        checkpoint["step"],
-        epoch=checkpoint.get("epoch", 0),
-        batch_index=checkpoint.get("batch_index", 0),
-        best_validation_loss=checkpoint.get("best_validation_loss"),
-        epochs_without_improvement=checkpoint.get(
-            "epochs_without_improvement", 0
-        ),
-    )
+    metadata = {
+        key: value
+        for key, value in checkpoint.items()
+        if key not in {
+            "model_state_dict",
+            "optimizer_state_dict",
+            "rng_state",
+            "scheduler_state_dict",
+        }
+    }
+    return CheckpointState(checkpoint["step"], **metadata)

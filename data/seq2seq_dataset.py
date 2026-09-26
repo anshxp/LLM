@@ -1,7 +1,6 @@
 """Streaming datasets for the v2 encoder-decoder model."""
 
 import json
-import re
 from pathlib import Path
 
 import torch
@@ -14,12 +13,7 @@ DEFAULT_TOKENIZER = Path("data/processed/tokenizer.json")
 
 
 class BookSeq2SeqDataset(IterableDataset):
-    """Turn book text into prefix-to-continuation training examples.
-
-    The encoder receives the first half of a window and the decoder learns the
-    continuation. This preserves a genuine language-modeling objective while
-    using the new encoder-decoder architecture.
-    """
+    """Turn book text into prefix-to-continuation training examples."""
 
     def __init__(self, corpus_file, tokenizer_path=DEFAULT_TOKENIZER, context_length=256, stride=None):
         self.corpus_file = Path(corpus_file)
@@ -46,6 +40,7 @@ class BookSeq2SeqDataset(IterableDataset):
                 yield "".join(buffer)
 
     def __iter__(self):
+        bos = self.tokenizer.token_to_id["<bos>"]
         for paragraph in self._paragraphs():
             token_ids = self.tokenizer.encode(paragraph, add_bos=True, add_eos=True)
             if len(token_ids) < self.source_length + self.target_length:
@@ -55,54 +50,56 @@ class BookSeq2SeqDataset(IterableDataset):
                 target = token_ids[start + self.source_length:start + self.source_length + self.target_length]
                 if len(source) != self.source_length or len(target) < 2:
                     continue
-                yield _make_example(source, target, self.tokenizer.token_to_id["<pad>"])
+                yield _make_example(source, target, bos)
 
 
 class InstructionSeq2SeqDataset(IterableDataset):
     """Streaming instruction dataset: encoder=prompt, decoder=response."""
 
-    def __init__(self, jsonl_file, tokenizer_path=DEFAULT_TOKENIZER, context_length=256):
-        self.jsonl_file = Path(jsonl_file)
+    def __init__(self, jsonl_file_or_dir, tokenizer_path=DEFAULT_TOKENIZER, context_length=256):
+        path = Path(jsonl_file_or_dir)
+        if path.is_dir():
+            self.files = sorted(path.glob("*.jsonl"))
+        elif path.exists():
+            self.files = [path]
+        else:
+            self.files = sorted(path.parent.glob(f"{path.stem}-*.jsonl"))
         self.tokenizer = Tokenizer.from_file(tokenizer_path)
         self.context_length = context_length
-        if not self.jsonl_file.exists():
-            raise FileNotFoundError(f"SFT dataset not found: {self.jsonl_file}")
+        if not self.files:
+            raise FileNotFoundError(f"No SFT JSONL shards found for {path}")
 
     def __iter__(self):
         bos = self.tokenizer.token_to_id["<bos>"]
-        eos = self.tokenizer.token_to_id["<eos>"]
-        pad = self.tokenizer.token_to_id["<pad>"]
-        with self.jsonl_file.open("r", encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, 1):
-                if not line.strip():
-                    continue
-                record = json.loads(line)
-                prompt, response = format_example(record)
-                source = self.tokenizer.encode(prompt, add_bos=True, add_eos=True)
-                target = self.tokenizer.encode(response, add_bos=False, add_eos=True)
-                if not target:
-                    continue
-                source = source[-self.context_length:]
-                target = target[:self.context_length - 1]
-                if not source or not target:
-                    continue
-                decoder_input = [bos] + target[:-1]
-                labels = target
-                yield {
-                    "encoder_input_ids": torch.tensor(source, dtype=torch.long),
-                    "decoder_input_ids": torch.tensor(decoder_input, dtype=torch.long),
-                    "labels": torch.tensor(labels, dtype=torch.long),
-                }
+        for jsonl_file in self.files:
+            with jsonl_file.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    record = json.loads(line)
+                    prompt, response = format_example(record)
+                    source = self.tokenizer.encode(prompt, add_bos=True, add_eos=True)
+                    target = self.tokenizer.encode(response, add_bos=False, add_eos=True)
+                    if not target:
+                        continue
+                    source = source[-self.context_length:]
+                    target = target[: self.context_length - 1]
+                    if not source or not target:
+                        continue
+                    decoder_input = [bos] + target[:-1]
+                    yield {
+                        "encoder_input_ids": torch.tensor(source, dtype=torch.long),
+                        "decoder_input_ids": torch.tensor(decoder_input, dtype=torch.long),
+                        "labels": torch.tensor(target, dtype=torch.long),
+                    }
 
 
-def _make_example(source, target, pad_id):
-    bos = source[0]
-    decoder_input = [bos] + target[:-1]
-    labels = target
+def _make_example(source, target, bos_id):
+    decoder_input = [bos_id] + target[:-1]
     return {
         "encoder_input_ids": torch.tensor(source, dtype=torch.long),
         "decoder_input_ids": torch.tensor(decoder_input, dtype=torch.long),
-        "labels": torch.tensor(labels, dtype=torch.long),
+        "labels": torch.tensor(target, dtype=torch.long),
     }
 
 

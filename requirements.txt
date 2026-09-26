@@ -7,3 +7,4 @@ fastapi
 uvicorn[standard]
 pyarrow
 openpyxl
+huggingface_hub

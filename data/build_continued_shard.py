@@ -18,9 +18,11 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Iterator
 
 from data.continued_pretraining_stream import (
     ExactDedupStore,
+    iter_local_shards,
     iter_local_texts,
     iter_training_texts,
 )
@@ -28,7 +30,7 @@ from data.continued_pretraining_stream import (
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser(description="Build one processed continued-pretraining shard.")
-    parser.add_argument("--input", required=True, type=Path, help="One local source file/directory.")
+    parser.add_argument("--input", required=True, type=Path, help="One local source file or directory.")
     parser.add_argument("--output-dir", required=True, type=Path, help="Output directory for the processed shard.")
     parser.add_argument(
         "--dedup-db",
@@ -41,13 +43,33 @@ def parse_args(args=None):
     return parser.parse_args(args)
 
 
-def _write_split(source, output_path: Path, dedup: ExactDedupStore, split: str, validation_mod: int):
+def _source_texts(source: Path, parquet_batch_size: int) -> Iterator[str]:
+    for _, path in iter_local_shards(source):
+        if path.suffix.lower() == ".parquet":
+            from data.continued_pretraining_stream import iter_parquet_records, record_to_text
+
+            for row in iter_parquet_records(path, batch_size=parquet_batch_size):
+                text = record_to_text(row)
+                if text:
+                    yield text
+        else:
+            yield from iter_local_texts(path)
+
+
+def _write_split(
+    source: Path,
+    output_path: Path,
+    dedup: ExactDedupStore,
+    split: str,
+    validation_mod: int,
+    parquet_batch_size: int,
+):
     count = 0
     chars = 0
     temporary = output_path.with_name(output_path.name + ".tmp")
     with temporary.open("w", encoding="utf-8") as handle:
         for text in iter_training_texts(
-            iter_local_texts(source),
+            _source_texts(source, parquet_batch_size),
             dedup=dedup,
             split=split,
             validation_mod=validation_mod,
@@ -80,10 +102,20 @@ def main(args=None):
 
     try:
         train_count, train_chars = _write_split(
-            options.input, train_path, dedup, "train", options.validation_mod
+            options.input,
+            train_path,
+            dedup,
+            "train",
+            options.validation_mod,
+            options.parquet_batch_size,
         )
         validation_count, validation_chars = _write_split(
-            options.input, validation_path, dedup, "validation", options.validation_mod
+            options.input,
+            validation_path,
+            dedup,
+            "validation",
+            options.validation_mod,
+            options.parquet_batch_size,
         )
         dedup.commit()
     finally:

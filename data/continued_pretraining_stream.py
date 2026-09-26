@@ -188,12 +188,12 @@ def iter_xml_records(path: Path) -> Iterator[str]:
         yield text
 
 
-def iter_local_texts(path: Path) -> Iterator[str]:
+def iter_local_texts(path: Path, parquet_batch_size: int = DEFAULT_PARQUET_BATCH_SIZE) -> Iterator[str]:
     suffix = path.suffix.lower()
     if suffix in {".txt", ".text", ".md", ".markdown"}:
         yield from iter_text_file(path)
     elif suffix == ".parquet":
-        for row in iter_parquet_records(path):
+        for row in iter_parquet_records(path, batch_size=parquet_batch_size):
             text = record_to_text(row)
             if text:
                 yield text

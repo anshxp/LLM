@@ -1,79 +1,72 @@
 from pathlib import Path
+from typing import Iterator
+
 import pymupdf
 
 
-def extract_pdf_text(pdf_path: str | Path) -> str:
-    """
-    Extract text from a PDF page by page.
-
-    Returns the combined extracted text.
-    """
-    pdf_path = Path(pdf_path)
-
+def _open_pdf(pdf_path: Path):
+    """Open a PDF reliably from bytes and give a useful error for bad files."""
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF does not exist: {pdf_path}")
-
     if pdf_path.suffix.lower() != ".pdf":
         raise ValueError(f"Expected a PDF file: {pdf_path}")
 
-    pages = []
+    raw = pdf_path.read_bytes()
+    if not raw.startswith(b"%PDF-"):
+        raise ValueError(
+            f"Invalid PDF file (missing %PDF header): {pdf_path}"
+        )
 
-    with pymupdf.open(pdf_path) as document:
+    try:
+        return pymupdf.open(stream=raw, filetype="pdf")
+    except Exception as exc:
+        raise ValueError(f"Unreadable/corrupt PDF: {pdf_path}: {exc}") from exc
+
+
+def iter_pdf_paragraphs(pdf_path: str | Path) -> Iterator[str]:
+    """Yield paragraph-like text blocks without loading the whole PDF into RAM."""
+    pdf_path = Path(pdf_path)
+    with _open_pdf(pdf_path) as document:
         for page in document:
-            text = page.get_text("text")
-            pages.append(text)
+            blocks = page.get_text("blocks", sort=True)
+            for block in blocks:
+                text = block[4].strip()
+                if text:
+                    yield text
 
-    return "\n".join(pages)
+
+def extract_pdf_text(pdf_path: str | Path) -> str:
+    """Extract PDF text while preserving paragraph boundaries."""
+    return "\n\n".join(iter_pdf_paragraphs(pdf_path))
 
 
 def inspect_pdf(pdf_path: str | Path) -> dict:
-    """
-    Inspect basic PDF extraction characteristics without
-    writing any files.
-    """
+    """Inspect basic PDF extraction characteristics without writing files."""
     pdf_path = Path(pdf_path)
-
-    if not pdf_path.exists():
-        raise FileNotFoundError(f"PDF does not exist: {pdf_path}")
-
-    with pymupdf.open(pdf_path) as document:
+    paragraphs = list(iter_pdf_paragraphs(pdf_path))
+    extracted_text = "\n\n".join(paragraphs)
+    with _open_pdf(pdf_path) as document:
         page_count = len(document)
-
-        extracted_text = "\n".join(
-            page.get_text("text")
-            for page in document
-        )
-
-    character_count = len(extracted_text)
-    word_count = len(extracted_text.split())
 
     return {
         "file": str(pdf_path),
         "pages": page_count,
-        "characters": character_count,
-        "words": word_count,
+        "paragraphs": len(paragraphs),
+        "characters": len(extracted_text),
+        "words": len(extracted_text.split()),
         "has_text": bool(extracted_text.strip()),
     }
 
 
 def inspect_pdf_images(pdf_path: str | Path) -> dict:
-    """
-    Inspect how many images are present in each PDF page.
-    """
+    """Inspect how many images are present in each PDF page."""
     pdf_path = Path(pdf_path)
-
-    if not pdf_path.exists():
-        raise FileNotFoundError(f"PDF does not exist: {pdf_path}")
-
-    with pymupdf.open(pdf_path) as document:
+    with _open_pdf(pdf_path) as document:
         page_count = len(document)
         image_count = 0
-
         pages_with_images = 0
-
         for page in document:
             images = page.get_images(full=True)
-
             if images:
                 pages_with_images += 1
                 image_count += len(images)
@@ -83,15 +76,4 @@ def inspect_pdf_images(pdf_path: str | Path) -> dict:
         "pages": page_count,
         "images": image_count,
         "pages_with_images": pages_with_images,
-    } 
-
-if __name__ == "__main__":
-    pdf_path = "data/raw/040515.pdf"
-
-    info = inspect_pdf(pdf_path)
-
-    print(f"File: {info['file']}")
-    print(f"Pages: {info['pages']}")
-    print(f"Characters: {info['characters']}")
-    print(f"Words: {info['words']}")
-    print(f"Has extractable text: {info['has_text']}")
+    }

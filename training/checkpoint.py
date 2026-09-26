@@ -112,6 +112,8 @@ def load_checkpoint(
     if restore_rng:
         _restore_rng_state(checkpoint.get("rng_state"))
 
+    # ``step`` is the positional argument to CheckpointState.  Keep it out of
+    # the keyword metadata even though it is also stored in the checkpoint.
     metadata = {
         key: value
         for key, value in checkpoint.items()
@@ -120,6 +122,7 @@ def load_checkpoint(
             "optimizer_state_dict",
             "rng_state",
             "scheduler_state_dict",
+            "step",
         }
     }
     return CheckpointState(checkpoint["step"], **metadata)

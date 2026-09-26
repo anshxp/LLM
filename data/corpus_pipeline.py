@@ -46,8 +46,7 @@ def _iter_parquet_text(path: Path):
     import pyarrow.parquet as pq
 
     parquet = pq.ParquetFile(path)
-    columns = parquet.schema_arrow.names
-    if "text" not in columns:
+    if "text" not in parquet.schema_arrow.names:
         raise ValueError(f"Parquet pretraining file has no 'text' column: {path}")
     for batch in parquet.iter_batches(batch_size=2048, columns=["text"]):
         for value in batch.column(0).to_pylist():
@@ -55,7 +54,10 @@ def _iter_parquet_text(path: Path):
                 yield str(value)
 
 
-def build_books(source_root: Path = PRETRAIN_ROOT, output_dir: Path = Path("data/processed/v2/books")) -> dict:
+def build_books(
+    source_root: Path = PRETRAIN_ROOT,
+    output_dir: Path = Path("data/processed/v2/books"),
+) -> dict:
     """Clean and deduplicate all pretraining material found under data/raw.
 
     Parquet is streamed in batches so the 57 GB TheBlueScrubs corpus does not
@@ -78,7 +80,9 @@ def build_books(source_root: Path = PRETRAIN_ROOT, output_dir: Path = Path("data
         for split in ("train", "validation", "test")
     }
     manifest_path = output_dir / "manifest.jsonl"
-    dedup_db = output_dir / "dedup.sqlite3"
+    # Temporary disk-backed index. It is deleted after a successful or failed run
+    # so the processed corpus does not retain another huge copy of the dataset.
+    dedup_db = output_dir / ".dedup.sqlite3"
     seen_near = []
     stats = {
         "files": 0,
@@ -152,6 +156,8 @@ def build_books(source_root: Path = PRETRAIN_ROOT, output_dir: Path = Path("data
         connection.close()
         for handle in handles.values():
             handle.close()
+        for suffix in ("", "-wal", "-shm"):
+            (output_dir / f".dedup.sqlite3{suffix}").unlink(missing_ok=True)
 
     if stats["accepted"] == 0:
         raise RuntimeError("No pretraining documents survived cleaning and deduplication")

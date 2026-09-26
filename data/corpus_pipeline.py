@@ -50,13 +50,7 @@ def build_books(source_root: Path, output_dir: Path) -> dict:
     manifest_path = output_dir / "manifest.jsonl"
     seen_hashes = set()
     seen_simhashes = []
-    stats = {
-        "files": 0,
-        "accepted": 0,
-        "rejected": 0,
-        "duplicates": 0,
-        "near_duplicates": 0,
-    }
+    stats = {"files": 0, "accepted": 0, "rejected": 0, "duplicates": 0, "near_duplicates": 0}
 
     try:
         with manifest_path.open("w", encoding="utf-8") as manifest:
@@ -87,19 +81,13 @@ def build_books(source_root: Path, output_dir: Path) -> dict:
 
                 split_name = _split_for_hash(content_hash)
                 handles[split_name].write(text.strip() + "\n\n")
-                manifest.write(
-                    json.dumps(
-                        {
-                            "source": str(path),
-                            "content_sha256": content_hash,
-                            "simhash": f"{fingerprint:016x}",
-                            "characters": len(text),
-                            "split": split_name,
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
+                manifest.write(json.dumps({
+                    "source": str(path),
+                    "content_sha256": content_hash,
+                    "simhash": f"{fingerprint:016x}",
+                    "characters": len(text),
+                    "split": split_name,
+                }, ensure_ascii=False) + "\n")
                 stats["accepted"] += 1
     finally:
         for handle in handles.values():
@@ -110,13 +98,10 @@ def build_books(source_root: Path, output_dir: Path) -> dict:
     return stats
 
 
-def build_sft(source_root: Path, output_dir: Path, tokenizer: Path, context_length: int) -> dict:
+def build_sft(source_root: Path, output_dir: Path, tokenizer: Path, context_length: int, shard_size: int) -> dict:
     """Prepare the large supervised corpus with disk-backed global deduplication."""
     return build_finetuning2(
-        Path(source_root),
-        Path(output_dir),
-        Path(tokenizer),
-        context_length,
+        Path(source_root), Path(output_dir), Path(tokenizer), context_length, shard_size
     )
 
 
@@ -136,6 +121,7 @@ def main() -> None:
         args.output_root / "sft",
         args.tokenizer,
         args.context_length,
+        args.sft_shard_size,
     )
     manifest = {"books": books, "sft": sft}
     (args.output_root / "manifest.json").write_text(

@@ -10,11 +10,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from config.seq2seq_model_config import Seq2SeqModelConfig
-from data.seq2seq_dataset import (
-    BookSeq2SeqDataset,
-    InstructionSeq2SeqDataset,
-    collate_seq2seq,
-)
+from data.seq2seq_dataset import BookSeq2SeqDataset, InstructionSeq2SeqDataset, collate_seq2seq
+from data.tokenizer import Tokenizer
 from model.encoder_decoder import EncoderDecoderLLM
 
 
@@ -63,13 +60,10 @@ def make_dataset(stage, split, args, config):
 
 def loss_for_batch(model, batch, device):
     encoder_ids, decoder_ids, labels = batch
-    encoder_ids = encoder_ids.to(device)
-    decoder_ids = decoder_ids.to(device)
-    labels = labels.to(device)
-    logits = model(encoder_ids, decoder_ids)
+    logits = model(encoder_ids.to(device), decoder_ids.to(device))
     return F.cross_entropy(
         logits.reshape(-1, logits.size(-1)),
-        labels.reshape(-1),
+        labels.to(device).reshape(-1),
         ignore_index=-100,
     )
 
@@ -77,13 +71,9 @@ def loss_for_batch(model, batch, device):
 @torch.no_grad()
 def evaluate(model, loader, device, max_batches):
     model.eval()
-    losses = []
-    for batch in islice(loader, max_batches):
-        losses.append(loss_for_batch(model, batch, device).item())
+    losses = [loss_for_batch(model, batch, device).item() for batch in islice(loader, max_batches)]
     model.train()
-    if not losses:
-        return math.inf
-    return sum(losses) / len(losses)
+    return sum(losses) / len(losses) if losses else math.inf
 
 
 def save_checkpoint(path, model, optimizer, step, validation_loss):
@@ -106,8 +96,12 @@ def main():
     torch.manual_seed(args.seed)
     device = device_from_arg(args.device)
     config = Seq2SeqModelConfig()
-    model = EncoderDecoderLLM(config).to(device)
+    tokenizer = Tokenizer.from_file(args.tokenizer)
+    if len(tokenizer) != config.vocab_size:
+        raise ValueError(f"Tokenizer vocabulary ({len(tokenizer)}) does not match model vocabulary ({config.vocab_size})")
+    pad_id = tokenizer.token_to_id["<pad>"]
 
+    model = EncoderDecoderLLM(config).to(device)
     if args.pretrained_checkpoint:
         if args.stage != "sft":
             raise ValueError("--pretrained-checkpoint is only used for the SFT stage")
@@ -123,26 +117,16 @@ def main():
     learning_rate = args.learning_rate or (2e-4 if args.stage == "pretrain" else 5e-5)
     train_dataset = make_dataset(args.stage, "train", args, config)
     validation_dataset = make_dataset(args.stage, "validation", args, config)
-    pad_id = 0
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        collate_fn=lambda batch: collate_seq2seq(batch, pad_id=pad_id),
-    )
-    validation_loader = DataLoader(
-        validation_dataset,
-        batch_size=1,
-        collate_fn=lambda batch: collate_seq2seq(batch, pad_id=pad_id),
-    )
+    loader_kwargs = {"batch_size": 1, "collate_fn": lambda batch: collate_seq2seq(batch, pad_id=pad_id)}
+    train_loader = DataLoader(train_dataset, **loader_kwargs)
+    validation_loader = DataLoader(validation_dataset, **loader_kwargs)
 
     print(f"Stage: {args.stage}")
     print(f"Device: {device}")
     print(f"Parameters: {model.num_parameters():,}")
-    print(f"Effective batch size: {args.batch_size * args.gradient_accumulation_steps}")
+    print(f"Effective batch size: {args.gradient_accumulation_steps}")
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=learning_rate, weight_decay=args.weight_decay
-    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=args.weight_decay)
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     best_loss = math.inf
     train_iter = iter(train_loader)
@@ -170,16 +154,10 @@ def main():
         if step % args.eval_every == 0 or step == args.max_steps:
             validation_loss = evaluate(model, validation_loader, device, args.eval_batches)
             print(f"step={step:,} validation_loss={validation_loss:.4f}")
-            save_checkpoint(
-                args.checkpoint_dir / f"model_step_{step}.pt",
-                model, optimizer, step, validation_loss,
-            )
+            save_checkpoint(args.checkpoint_dir / f"model_step_{step}.pt", model, optimizer, step, validation_loss)
             if validation_loss < best_loss:
                 best_loss = validation_loss
-                save_checkpoint(
-                    args.checkpoint_dir / "best_model.pt",
-                    model, optimizer, step, validation_loss,
-                )
+                save_checkpoint(args.checkpoint_dir / "best_model.pt", model, optimizer, step, validation_loss)
                 print("New best checkpoint saved.")
 
     print(f"Training complete. Best validation loss: {best_loss:.4f}")

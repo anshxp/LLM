@@ -53,26 +53,29 @@ def _iter_parquet_text(path: Path) -> Iterator[str]:
 
 
 def iter_shard_text(path: Path) -> Iterator[str]:
-    """Stream one raw shard at a time with bounded memory."""
+    """Stream one raw shard at a time with bounded memory; bad files are skipped."""
     suffix = path.suffix.lower()
-    if suffix == ".parquet":
-        source = _iter_parquet_text(path)
-    elif suffix == ".pdf":
-        for paragraph in iter_pdf_paragraphs(path):
-            text = clean_text(paragraph)
+    try:
+        if suffix == ".parquet":
+            source = _iter_parquet_text(path)
+        elif suffix == ".pdf":
+            for paragraph in iter_pdf_paragraphs(path):
+                text = clean_text(paragraph)
+                if passes_basic_filters(text):
+                    yield text
+            return
+        else:
+            text = clean_text(path.read_text(encoding="utf-8", errors="replace"))
             if passes_basic_filters(text):
                 yield text
-        return
-    else:
-        text = clean_text(path.read_text(encoding="utf-8", errors="replace"))
-        if passes_basic_filters(text):
-            yield text
-        return
+            return
 
-    for text in source:
-        text = clean_text(text)
-        if passes_basic_filters(text):
-            yield text
+        for text in source:
+            text = clean_text(text)
+            if passes_basic_filters(text):
+                yield text
+    except Exception as exc:
+        print(f"Skipping unreadable pretraining shard: {path}: {exc}")
 
 
 def iter_pretraining_text(source_root: Path = PRETRAIN_ROOT) -> Iterator[tuple[str, str]]:
@@ -114,30 +117,29 @@ def build_pretraining_manifest(
         with manifest_path.open("w", encoding="utf-8") as manifest:
             for source, documents in iter_pretraining_shards(source_root):
                 stats["files"] += 1
-                try:
-                    for text in documents:
-                        stats["documents_seen"] += 1
-                        normalized = " ".join(text.split())
-                        digest = hashlib.sha256(normalized.encode("utf-8")).digest()
-                        if not db.execute("INSERT OR IGNORE INTO seen VALUES (?)", (digest,)).rowcount:
-                            stats["duplicates"] += 1
+                before = stats["documents_seen"]
+                for text in documents:
+                    stats["documents_seen"] += 1
+                    normalized = " ".join(text.split())
+                    digest = hashlib.sha256(normalized.encode("utf-8")).digest()
+                    if not db.execute("INSERT OR IGNORE INTO seen VALUES (?)", (digest,)).rowcount:
+                        stats["duplicates"] += 1
+                        continue
+                    if source.lower().endswith((".txt", ".text", ".md", ".markdown", ".pdf")):
+                        fingerprint = simhash(text)
+                        if is_near_duplicate(fingerprint, seen_near):
+                            stats["near_duplicates"] += 1
                             continue
-                        if source.lower().endswith((".txt", ".text", ".md", ".markdown", ".pdf")):
-                            fingerprint = simhash(text)
-                            if is_near_duplicate(fingerprint, seen_near):
-                                stats["near_duplicates"] += 1
-                                continue
-                            seen_near.append(fingerprint)
-                        manifest.write(
-                            json.dumps(
-                                {"source": source, "sha256": digest.hex(), "characters": len(text)},
-                                ensure_ascii=False,
-                            ) + "\n"
-                        )
-                        stats["accepted"] += 1
-                except Exception as exc:
+                        seen_near.append(fingerprint)
+                    manifest.write(
+                        json.dumps(
+                            {"source": source, "sha256": digest.hex(), "characters": len(text)},
+                            ensure_ascii=False,
+                        ) + "\n"
+                    )
+                    stats["accepted"] += 1
+                if stats["documents_seen"] == before:
                     stats["extraction_failures"] += 1
-                    print(f"Skipped unreadable shard: {source}: {exc}")
             db.commit()
     finally:
         db.close()

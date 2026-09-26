@@ -1,14 +1,19 @@
-"""Build the compact corpus artifacts used by v2 training.
+"""Build the compact v2 corpus artifacts.
 
-Books are cleaned into train/validation/test text splits. The large supervised
-corpus is passed through the existing disk-backed Fine tuning 2 pipeline so
-JSON/JSONL/CSV/TSV/XML/XLSX/Parquet/ZIP sources can be processed without
-loading the complete corpus into RAM.
+Repository data layout is intentionally fixed:
+
+    data/raw/            all pretraining sources (books + parquet corpora)
+    data/Fine tuning 2/  supervised fine-tuning sources
+
+The large source corpora are never committed to Git. This module only creates
+processed training artifacts under data/processed/v2.
 """
+from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import sqlite3
 from pathlib import Path
 
 from data.cleaner import clean_text
@@ -17,8 +22,12 @@ from data.filters import passes_basic_filters
 from data.pdf_extractor import extract_pdf_text
 from data.finetuning2_pipeline import build as build_finetuning2
 
+# Fixed repository layout. Keep these paths stable for Colab and local training.
+PRETRAIN_ROOT = Path("data/raw")
+SFT_ROOT = Path("data/Fine tuning 2")
+
 SUPPORTED_TEXT = {".txt", ".md", ".markdown"}
-SUPPORTED = SUPPORTED_TEXT | {".pdf"}
+SUPPORTED = SUPPORTED_TEXT | {".pdf", ".parquet"}
 
 
 def _extract(path: Path) -> str:
@@ -32,8 +41,29 @@ def _split_for_hash(value: str) -> str:
     return "train" if bucket < 90 else "validation" if bucket < 95 else "test"
 
 
-def build_books(source_root: Path, output_dir: Path) -> dict:
-    """Clean, exact-deduplicate and near-deduplicate book/source files."""
+def _iter_parquet_text(path: Path):
+    """Stream only the text column from a local Parquet pretraining shard."""
+    import pyarrow.parquet as pq
+
+    parquet = pq.ParquetFile(path)
+    columns = parquet.schema_arrow.names
+    if "text" not in columns:
+        raise ValueError(f"Parquet pretraining file has no 'text' column: {path}")
+    for batch in parquet.iter_batches(batch_size=2048, columns=["text"]):
+        for value in batch.column(0).to_pylist():
+            if value is not None:
+                yield str(value)
+
+
+def build_books(source_root: Path = PRETRAIN_ROOT, output_dir: Path = Path("data/processed/v2/books")) -> dict:
+    """Clean and deduplicate all pretraining material found under data/raw.
+
+    Parquet is streamed in batches so the 57 GB TheBlueScrubs corpus does not
+    get loaded into RAM. Its documented train field is ``text``. Exact
+    deduplication is disk-backed for every source; in-memory near-duplicate
+    detection is used only for non-Parquet book files so it cannot grow with
+    the multi-billion-token corpus.
+    """
     source_root = Path(source_root).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     paths = sorted(
@@ -41,89 +71,138 @@ def build_books(source_root: Path, output_dir: Path) -> dict:
         if p.is_file() and p.suffix.lower() in SUPPORTED
     )
     if not paths:
-        raise FileNotFoundError(f"No supported book files found under {source_root}")
+        raise FileNotFoundError(f"No supported pretraining files found under {source_root}")
 
     handles = {
         split: (output_dir / f"{split}.txt").open("w", encoding="utf-8")
         for split in ("train", "validation", "test")
     }
     manifest_path = output_dir / "manifest.jsonl"
-    seen_hashes = set()
-    seen_simhashes = []
-    stats = {"files": 0, "accepted": 0, "rejected": 0, "duplicates": 0, "near_duplicates": 0}
+    dedup_db = output_dir / "dedup.sqlite3"
+    seen_near = []
+    stats = {
+        "files": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "duplicates": 0,
+        "near_duplicates": 0,
+        "parquet_rows_seen": 0,
+    }
+
+    connection = sqlite3.connect(dedup_db)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("CREATE TABLE IF NOT EXISTS seen (content_sha256 BLOB PRIMARY KEY)")
+    connection.commit()
+
+    def process_text(text: str, path: Path, manifest) -> None:
+        text = clean_text(text)
+        if not passes_basic_filters(text):
+            stats["rejected"] += 1
+            return
+
+        normalized = " ".join(text.split())
+        content_hash = hashlib.sha256(normalized.encode("utf-8")).digest()
+        inserted = connection.execute(
+            "INSERT OR IGNORE INTO seen(content_sha256) VALUES (?)", (content_hash,)
+        ).rowcount
+        if not inserted:
+            stats["duplicates"] += 1
+            return
+
+        # Avoid retaining millions of SimHash values for the large Parquet corpus.
+        if path.suffix.lower() != ".parquet":
+            fingerprint = simhash(text)
+            if is_near_duplicate(fingerprint, seen_near):
+                stats["near_duplicates"] += 1
+                return
+            seen_near.append(fingerprint)
+        else:
+            fingerprint = None
+
+        split_name = _split_for_hash(content_hash.hex())
+        handles[split_name].write(text.strip() + "\n\n")
+        entry = {
+            "source": str(path.relative_to(source_root)),
+            "content_sha256": content_hash.hex(),
+            "characters": len(text),
+            "split": split_name,
+        }
+        if fingerprint is not None:
+            entry["simhash"] = f"{fingerprint:016x}"
+        manifest.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        stats["accepted"] += 1
 
     try:
         with manifest_path.open("w", encoding="utf-8") as manifest:
             for path in paths:
                 stats["files"] += 1
                 try:
-                    text = clean_text(_extract(path))
+                    if path.suffix.lower() == ".parquet":
+                        for text in _iter_parquet_text(path):
+                            stats["parquet_rows_seen"] += 1
+                            process_text(text, path, manifest)
+                    else:
+                        process_text(_extract(path), path, manifest)
+                    connection.commit()
                 except Exception as exc:
                     stats["rejected"] += 1
-                    print(f"[books] extraction failed: {path}: {exc}")
-                    continue
-                if not passes_basic_filters(text):
-                    stats["rejected"] += 1
-                    continue
-
-                normalized = " ".join(text.split())
-                content_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-                if content_hash in seen_hashes:
-                    stats["duplicates"] += 1
-                    continue
-                seen_hashes.add(content_hash)
-
-                fingerprint = simhash(text)
-                if is_near_duplicate(fingerprint, seen_simhashes):
-                    stats["near_duplicates"] += 1
-                    continue
-                seen_simhashes.append(fingerprint)
-
-                split_name = _split_for_hash(content_hash)
-                handles[split_name].write(text.strip() + "\n\n")
-                manifest.write(json.dumps({
-                    "source": str(path),
-                    "content_sha256": content_hash,
-                    "simhash": f"{fingerprint:016x}",
-                    "characters": len(text),
-                    "split": split_name,
-                }, ensure_ascii=False) + "\n")
-                stats["accepted"] += 1
+                    print(f"[pretrain] extraction failed: {path}: {exc}")
     finally:
+        connection.commit()
+        connection.close()
         for handle in handles.values():
             handle.close()
 
     if stats["accepted"] == 0:
-        raise RuntimeError("No book documents survived cleaning and deduplication")
+        raise RuntimeError("No pretraining documents survived cleaning and deduplication")
     return stats
 
 
-def build_sft(source_root: Path, output_dir: Path, tokenizer: Path, context_length: int, shard_size: int) -> dict:
-    """Prepare the large supervised corpus with disk-backed global deduplication."""
+def build_sft(
+    source_root: Path = SFT_ROOT,
+    output_dir: Path = Path("data/processed/v2/sft"),
+    tokenizer: Path = Path("data/processed/tokenizer.json"),
+    context_length: int = 256,
+    shard_size: int = 50_000,
+) -> dict:
+    """Prepare the supervised corpus from the fixed Fine tuning 2 directory."""
     return build_finetuning2(
         Path(source_root), Path(output_dir), Path(tokenizer), context_length, shard_size
     )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build v2 book-pretraining and SFT corpora.")
-    parser.add_argument("--books-root", type=Path, required=True)
-    parser.add_argument("--sft-root", type=Path, required=True)
+    parser = argparse.ArgumentParser(description="Build v2 pretraining and SFT corpora.")
     parser.add_argument("--output-root", type=Path, default=Path("data/processed/v2"))
     parser.add_argument("--tokenizer", type=Path, default=Path("data/processed/tokenizer.json"))
     parser.add_argument("--context-length", type=int, default=256)
     parser.add_argument("--sft-shard-size", type=int, default=50_000)
     args = parser.parse_args()
 
-    books = build_books(args.books_root, args.output_root / "books")
+    if not PRETRAIN_ROOT.is_dir():
+        raise FileNotFoundError(
+            "Pretraining corpus not found at data/raw. Put all book and pretraining "
+            "files under data/raw before running the pipeline."
+        )
+    if not SFT_ROOT.is_dir():
+        raise FileNotFoundError(
+            "Fine tuning 2 corpus not found at data/Fine tuning 2."
+        )
+
+    books = build_books(PRETRAIN_ROOT, args.output_root / "books")
     sft = build_sft(
-        args.sft_root,
+        SFT_ROOT,
         args.output_root / "sft",
         args.tokenizer,
         args.context_length,
         args.sft_shard_size,
     )
-    manifest = {"books": books, "sft": sft}
+    manifest = {
+        "pretraining_root": str(PRETRAIN_ROOT),
+        "sft_root": str(SFT_ROOT),
+        "books": books,
+        "sft": sft,
+    }
     (args.output_root / "manifest.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False),
         encoding="utf-8",

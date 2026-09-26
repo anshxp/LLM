@@ -165,7 +165,7 @@ def _source_text_factory(path: Path, args):
         store = ExactDedupStore(dedup_path)
         try:
             for text in iter_training_texts(
-                iter_local_texts(path),
+                iter_local_texts(path, parquet_batch_size=args.parquet_batch_size),
                 dedup=store,
                 split=split,
                 validation_mod=args.validation_mod,

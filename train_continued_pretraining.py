@@ -231,6 +231,7 @@ def train_one_shard(
     checkpoint_path,
     global_step,
     shard_index,
+    shard_name,
     resume_batch,
 ):
     model.train()
@@ -279,13 +280,12 @@ def train_one_shard(
                 global_step,
                 checkpoint_path,
                 batch_index=batch_index + 1,
-                extra_state={"shard_index": shard_index},
+                extra_state={"shard_index": shard_index, "shard_name": shard_name},
             )
             print(f"Progress checkpoint saved: {checkpoint_path}")
 
     if accumulation_count:
-        current_accumulation = accumulation_count
-        scale = args.gradient_accumulation_steps / current_accumulation
+        scale = args.gradient_accumulation_steps / accumulation_count
         for parameter in model.parameters():
             if parameter.grad is not None:
                 parameter.grad.mul_(scale)
@@ -341,13 +341,20 @@ def main(args=None):
     )
 
     completed_shards = state.get("completed_shards", 0) if state is not None else 0
-    resume_shard = state.get("shard_index", 0) if state is not None else 0
     resume_batch = state.get("batch_index", 0) if state is not None else 0
     global_step = int(state) if state is not None else 0
 
-    if completed_shards:
-        resume_shard = completed_shards
-        resume_batch = 0
+    if state is None:
+        resume_shard = 0
+    else:
+        saved_name = state.get("shard_name")
+        if saved_name:
+            matching = [index for index, (_, name, _) in enumerate(shards) if name == saved_name]
+            resume_shard = matching[0] + (1 if completed_shards else 0) if matching else 0
+        else:
+            resume_shard = state.get("shard_index", 0)
+        if completed_shards:
+            resume_batch = 0
 
     for shard_index in range(resume_shard, len(shards)):
         kind, name, payload = shards[shard_index]
@@ -389,6 +396,7 @@ def main(args=None):
                 checkpoint_path,
                 global_step,
                 shard_index,
+                name,
                 shard_resume_batch,
             )
 

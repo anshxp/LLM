@@ -27,6 +27,8 @@ from data.continued_pretraining_stream import (
     iter_training_texts,
 )
 
+COMPLETE_MARKER = ".complete"
+
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser(description="Build one processed continued-pretraining shard.")
@@ -77,8 +79,6 @@ def _write_split(
             handle.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
             count += 1
             chars += len(text)
-            if count % 1000 == 0:
-                dedup.commit()
     temporary.replace(output_path)
     return count, chars
 
@@ -93,8 +93,17 @@ def main(args=None):
         raise ValueError("parquet-batch-size must be positive")
 
     options.output_dir.mkdir(parents=True, exist_ok=True)
+    complete_marker = options.output_dir / COMPLETE_MARKER
+    if complete_marker.exists():
+        print(f"Processed shard already complete: {options.output_dir}")
+        return
+
     dedup_path = options.dedup_db or (options.output_dir / "dedup.sqlite3")
     dedup = ExactDedupStore(dedup_path)
+    # Keep the whole shard's dedup transaction open. If the process fails,
+    # SQLite rolls back the uncommitted transaction, so a rebuild cannot lose
+    # documents merely because an earlier partial output existed.
+    dedup.commit_every = 10**18
 
     train_path = options.output_dir / "train.jsonl"
     validation_path = options.output_dir / "validation.jsonl"
@@ -117,18 +126,19 @@ def main(args=None):
             options.validation_mod,
             options.parquet_batch_size,
         )
+
+        manifest = {
+            "source": str(options.input),
+            "train": {"documents": train_count, "characters": train_chars},
+            "validation": {"documents": validation_count, "characters": validation_chars},
+            "validation_mod": options.validation_mod,
+            "format": "jsonl",
+        }
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         dedup.commit()
+        complete_marker.write_text("complete\n", encoding="utf-8")
     finally:
         dedup.close()
-
-    manifest = {
-        "source": str(options.input),
-        "train": {"documents": train_count, "characters": train_chars},
-        "validation": {"documents": validation_count, "characters": validation_chars},
-        "validation_mod": options.validation_mod,
-        "format": "jsonl",
-    }
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     print("Processed shard complete")
     print(f"  source: {options.input}")

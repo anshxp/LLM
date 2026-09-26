@@ -1,20 +1,38 @@
-"""Continued pretraining from the Phase 7 foundation checkpoint.
+"""RAM-efficient, shard-by-shard continued pretraining.
 
-This trainer is intentionally separate from instruction SFT. It uses the same
-next-token objective as base pretraining, reuses the existing 10k BPE tokenizer,
-and automatically resumes from checkpoints/continued_pretraining/latest.pt.
+Workflow:
+1. Train on the local seed shard(s) first.
+2. Discover Parquet files on Hugging Face.
+3. Download exactly one remote Parquet shard.
+4. Stream rows -> clean/filter/dedup -> tokenize -> context windows.
+5. Continue from the previous checkpoint.
+6. Save a checkpoint at shard completion and before moving to the next shard.
+7. Delete the downloaded shard before downloading the next one.
+
+No 2.5GB Parquet file is loaded into RAM as a whole, and the complete 57GB
+corpus is never materialized as one processed text file.
 """
+from __future__ import annotations
 
 import argparse
-import math
+import shutil
+import time
 from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
 
 from config.model_config import ModelConfig
-from data.dataset import LanguageModelDataset
-from data.prepare_training_data import load_token_ids_from_file
+from data.continued_pretraining_stream import (
+    ExactDedupStore,
+    StreamingTokenDataset,
+    download_hf_shard,
+    hf_parquet_files,
+    iter_local_shards,
+    iter_local_texts,
+    iter_training_texts,
+)
+from data.tokenizer import Tokenizer
 from evaluation.evaluate import evaluate
 from model.llm import LLM
 from training.checkpoint import load_checkpoint, save_checkpoint
@@ -22,48 +40,66 @@ from training.loss import language_model_loss
 from training.optimizer import create_optimizer
 
 DEFAULT_PRETRAIN_CHECKPOINT = Path("checkpoints/phase7_run/best_model.pt")
-DEFAULT_CORPUS_DIR = Path("data/processed/continued_pretraining")
-DEFAULT_OLD_VALIDATION = Path("data/processed/validation.txt")
+DEFAULT_TOKENIZER = Path("data/processed/tokenizer.json")
 DEFAULT_CHECKPOINT_DIR = Path("checkpoints/continued_pretraining")
+DEFAULT_DEDUP_DB = Path("checkpoints/continued_pretraining/dedup.sqlite3")
+DEFAULT_DOWNLOAD_DIR = Path("checkpoints/continued_pretraining/downloads")
 DEFAULT_BATCH_SIZE = 1
 DEFAULT_GRADIENT_ACCUMULATION = 4
 DEFAULT_LEARNING_RATE = 3e-4
 DEFAULT_WEIGHT_DECAY = 0.01
-DEFAULT_EPOCHS = 1
-DEFAULT_LOG_EVERY = 50
 DEFAULT_CHECKPOINT_EVERY = 500
+DEFAULT_LOG_EVERY = 50
 DEFAULT_MAX_GRAD_NORM = 1.0
-DEFAULT_TRAIN_STRIDE = 128
-DEFAULT_EVAL_STRIDE = 256
-DEFAULT_LR_MIN = 3e-5
+DEFAULT_VALIDATION_MOD = 20
+DEFAULT_PARQUET_BATCH_SIZE = 4096
 
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser(
-        description="Continue pretraining from the Phase 7 foundation checkpoint."
+        description="Stream local/Hugging Face shards through continued pretraining."
     )
+    parser.add_argument(
+        "--local-shard",
+        action="append",
+        type=Path,
+        help="Local seed file or directory. Multiple values are processed first, in order.",
+    )
+    parser.add_argument("--hf-repo-id", type=str, default=None)
+    parser.add_argument(
+        "--hf-repo-type",
+        choices=("dataset", "space", "model"),
+        default="dataset",
+    )
+    parser.add_argument("--hf-revision", type=str, default=None)
+    parser.add_argument("--hf-pattern", type=str, default="*.parquet")
+    parser.add_argument("--start-shard", type=int, default=0)
+    parser.add_argument("--max-shards", type=int, default=None)
     parser.add_argument("--pretrained-checkpoint", type=Path, default=DEFAULT_PRETRAIN_CHECKPOINT)
-    parser.add_argument("--corpus-dir", type=Path, default=DEFAULT_CORPUS_DIR)
-    parser.add_argument("--old-validation", type=Path, default=DEFAULT_OLD_VALIDATION)
+    parser.add_argument("--tokenizer", type=Path, default=DEFAULT_TOKENIZER)
     parser.add_argument("--checkpoint-dir", type=Path, default=DEFAULT_CHECKPOINT_DIR)
+    parser.add_argument("--dedup-db", type=Path, default=DEFAULT_DEDUP_DB)
+    parser.add_argument("--download-dir", type=Path, default=DEFAULT_DOWNLOAD_DIR)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=DEFAULT_GRADIENT_ACCUMULATION)
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=DEFAULT_GRADIENT_ACCUMULATION,
+    )
     parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
     parser.add_argument("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY)
-    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
-    parser.add_argument("--log-every", type=int, default=DEFAULT_LOG_EVERY)
     parser.add_argument("--checkpoint-every-steps", type=int, default=DEFAULT_CHECKPOINT_EVERY)
+    parser.add_argument("--log-every", type=int, default=DEFAULT_LOG_EVERY)
     parser.add_argument("--max-grad-norm", type=float, default=DEFAULT_MAX_GRAD_NORM)
-    parser.add_argument("--train-stride", type=int, default=DEFAULT_TRAIN_STRIDE)
-    parser.add_argument("--eval-stride", type=int, default=DEFAULT_EVAL_STRIDE)
-    parser.add_argument("--lr-min", type=float, default=DEFAULT_LR_MIN)
+    parser.add_argument("--validation-mod", type=int, default=DEFAULT_VALIDATION_MOD)
+    parser.add_argument("--parquet-batch-size", type=int, default=DEFAULT_PARQUET_BATCH_SIZE)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
-        "--no-auto-resume",
+        "--reset-run",
         action="store_true",
-        help="Ignore latest.pt and start from the Phase 7 pretrained weights.",
+        help="Ignore an existing continued-pretraining checkpoint and start from foundation weights.",
     )
     parsed = parser.parse_args(args)
     validate_args(parsed)
@@ -71,246 +107,338 @@ def parse_args(args=None):
 
 
 def validate_args(args):
-    if args.batch_size <= 0:
-        raise ValueError("batch_size must be positive")
-    if args.gradient_accumulation_steps <= 0:
-        raise ValueError("gradient_accumulation_steps must be positive")
-    if args.learning_rate <= 0:
-        raise ValueError("learning_rate must be positive")
-    if args.weight_decay < 0:
-        raise ValueError("weight_decay must be non-negative")
-    if args.epochs <= 0:
-        raise ValueError("epochs must be positive")
-    if args.log_every <= 0 or args.checkpoint_every_steps <= 0:
-        raise ValueError("log_every and checkpoint_every_steps must be positive")
-    if args.max_grad_norm <= 0:
-        raise ValueError("max_grad_norm must be positive")
-    if args.train_stride <= 0 or args.eval_stride <= 0:
-        raise ValueError("strides must be positive")
-    if args.lr_min <= 0 or args.lr_min > args.learning_rate:
-        raise ValueError("lr_min must be positive and no greater than learning_rate")
-    if args.num_workers < 0:
-        raise ValueError("num_workers must be non-negative")
+    if not args.local_shard and not args.hf_repo_id:
+        raise ValueError("Provide at least one --local-shard or --hf-repo-id.")
+    if args.batch_size <= 0 or args.gradient_accumulation_steps <= 0:
+        raise ValueError("batch-size and gradient-accumulation-steps must be positive.")
+    if args.learning_rate <= 0 or args.weight_decay < 0:
+        raise ValueError("learning-rate must be positive and weight-decay non-negative.")
+    if args.checkpoint_every_steps <= 0 or args.log_every <= 0:
+        raise ValueError("checkpoint/log intervals must be positive.")
+    if args.max_grad_norm <= 0 or args.validation_mod < 2:
+        raise ValueError("max-grad-norm must be positive and validation-mod must be >= 2.")
+    if args.parquet_batch_size <= 0 or args.num_workers < 0:
+        raise ValueError("parquet-batch-size must be positive and num-workers non-negative.")
+    if args.start_shard < 0:
+        raise ValueError("start-shard must be non-negative.")
+    if args.max_shards is not None and args.max_shards <= 0:
+        raise ValueError("max-shards must be positive when supplied.")
 
 
-def resolve_device(requested):
+def resolve_device(requested: str) -> torch.device:
     if requested == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested but is not available")
-    if requested == "cpu":
-        return torch.device("cpu")
+        raise RuntimeError("CUDA was requested but CUDA is not available.")
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def _load_dataset_from_file(path: Path, context_length: int, stride: int):
-    token_ids = load_token_ids_from_file(path)
-    return LanguageModelDataset(token_ids, context_length=context_length, stride=stride)
+def discover_shards(args) -> list[tuple[str, str, object]]:
+    shards: list[tuple[str, str, object]] = []
+
+    for local in args.local_shard or []:
+        for source_name, path in iter_local_shards(local):
+            shards.append(("local", source_name, path))
+
+    if args.hf_repo_id:
+        files = hf_parquet_files(
+            args.hf_repo_id,
+            repo_type=args.hf_repo_type,
+            revision=args.hf_revision,
+            pattern=args.hf_pattern,
+        )
+        remote_files = files[args.start_shard:]
+        if args.max_shards is not None:
+            remote_files = remote_files[: args.max_shards]
+        for filename in remote_files:
+            shards.append(("hf", filename, filename))
+
+    if not shards:
+        raise ValueError("No training shards were discovered.")
+    return shards
 
 
-def _load_dataset(corpus_dir: Path, split: str, context_length: int, stride: int):
-    return _load_dataset_from_file(corpus_dir / f"{split}.txt", context_length, stride)
+def _source_text_factory(path: Path, args):
+    def factory(split: str):
+        suffix = Path(args.dedup_db).suffix or ".sqlite3"
+        dedup_path = Path(args.dedup_db).with_name(
+            f"{Path(args.dedup_db).stem}_{split}{suffix}"
+        )
+        store = ExactDedupStore(dedup_path)
+        try:
+            for text in iter_training_texts(
+                iter_local_texts(path),
+                dedup=store,
+                split=split,
+                validation_mod=args.validation_mod,
+            ):
+                yield text
+        finally:
+            store.commit()
+            store.close()
+
+    return factory
 
 
-def _load_pretrained_weights(model, path: Path, device):
-    if not path.exists():
-        raise FileNotFoundError(f"Pretrained checkpoint not found: {path}")
-    checkpoint = torch.load(path, map_location=device, weights_only=False)
+def _build_loader(factory, tokenizer, context_length, split, args):
+    dataset = StreamingTokenDataset(
+        factory,
+        tokenizer,
+        context_length=context_length,
+        split=split,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+
+def _load_or_initialize(model, optimizer, checkpoint_path, foundation_path, device, reset):
+    if checkpoint_path.exists() and not reset:
+        state = load_checkpoint(
+            model,
+            optimizer,
+            checkpoint_path,
+            map_location=device,
+            restore_rng=True,
+        )
+        print(
+            f"Resumed checkpoint: step={int(state)} "
+            f"shard_index={state.get('shard_index', 0)} "
+            f"batch_index={state.get('batch_index', 0)}"
+        )
+        return state
+
+    if not foundation_path.exists():
+        raise FileNotFoundError(f"Foundation checkpoint not found: {foundation_path}")
+
+    checkpoint = torch.load(foundation_path, map_location=device, weights_only=False)
     state_dict = checkpoint.get("model_state_dict", checkpoint.get("model"))
     if state_dict is None:
-        raise ValueError("Pretrained checkpoint does not contain model weights")
+        raise ValueError("Foundation checkpoint does not contain model weights.")
     model.load_state_dict(state_dict)
-    print(f"Loaded foundation weights from {path}")
+    print(f"Loaded foundation weights from {foundation_path}")
+    return None
+
+
+def train_one_shard(
+    model,
+    optimizer,
+    train_loader,
+    device,
+    args,
+    checkpoint_path,
+    global_step,
+    shard_index,
+    resume_batch,
+):
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    running_loss = 0.0
+    accumulation_count = 0
+    start = time.time()
+
+    for batch_index, (input_ids, target_ids) in enumerate(train_loader):
+        if batch_index < resume_batch:
+            continue
+
+        input_ids = input_ids.to(device, non_blocking=True)
+        target_ids = target_ids.to(device, non_blocking=True)
+
+        logits = model(input_ids)
+        loss = language_model_loss(logits, target_ids)
+        (loss / args.gradient_accumulation_steps).backward()
+        running_loss += loss.item()
+        accumulation_count += 1
+
+        if accumulation_count != args.gradient_accumulation_steps:
+            continue
+
+        current_accumulation = accumulation_count
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        global_step += 1
+        accumulation_count = 0
+
+        if global_step == 1 or global_step % args.log_every == 0:
+            elapsed = max(time.time() - start, 0.001)
+            print(
+                f"Shard {shard_index} | Step {global_step} | "
+                f"Batch {batch_index + 1} | Loss {running_loss / current_accumulation:.4f} | "
+                f"LR {optimizer.param_groups[0]['lr']:.2e} | "
+                f"{(batch_index + 1) / elapsed:.2f} batches/s"
+            )
+            running_loss = 0.0
+
+        if global_step % args.checkpoint_every_steps == 0:
+            save_checkpoint(
+                model,
+                optimizer,
+                global_step,
+                checkpoint_path,
+                batch_index=batch_index + 1,
+                extra_state={"shard_index": shard_index},
+            )
+            print(f"Progress checkpoint saved: {checkpoint_path}")
+
+    if accumulation_count:
+        current_accumulation = accumulation_count
+        scale = args.gradient_accumulation_steps / current_accumulation
+        for parameter in model.parameters():
+            if parameter.grad is not None:
+                parameter.grad.mul_(scale)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        global_step += 1
+
+    return global_step
 
 
 def main(args=None):
     args = parse_args(args)
     device = resolve_device(args.device)
     torch.manual_seed(args.seed)
+
     config = ModelConfig()
+    tokenizer = Tokenizer.from_file(args.tokenizer)
+    if len(tokenizer) != config.vocab_size:
+        raise ValueError(
+            f"Tokenizer vocabulary ({len(tokenizer)}) does not match model vocabulary "
+            f"({config.vocab_size})."
+        )
 
-    corpus_dir = args.corpus_dir
-    train_dataset = _load_dataset(corpus_dir, "train", config.context_length, args.train_stride)
-    validation_dataset = _load_dataset(corpus_dir, "validation", config.context_length, args.eval_stride)
-    old_validation_dataset = _load_dataset_from_file(
-        args.old_validation, config.context_length, args.eval_stride
-    )
-    if len(train_dataset) == 0 or len(validation_dataset) == 0 or len(old_validation_dataset) == 0:
-        raise ValueError("All training and validation splits must contain complete sequences")
-
-    # Sequential ordering is deliberate. It makes batch_index in the checkpoint
-    # an exact resume cursor instead of depending on DataLoader shuffle state.
-    loader_kwargs = {
-        "batch_size": args.batch_size,
-        "shuffle": False,
-        "num_workers": args.num_workers,
-        "pin_memory": torch.cuda.is_available(),
-    }
-    train_loader = DataLoader(train_dataset, **loader_kwargs)
-    validation_loader = DataLoader(validation_dataset, **loader_kwargs)
-    old_validation_loader = DataLoader(old_validation_dataset, **loader_kwargs)
-
-    model = LLM(config).to(device)
-    optimizer = create_optimizer(
-        model, learning_rate=args.learning_rate, weight_decay=args.weight_decay
-    )
-    updates_per_epoch = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=max(1, updates_per_epoch * args.epochs),
-        eta_min=args.lr_min,
-    )
+    shards = discover_shards(args)
+    print("=" * 72)
+    print("STREAMING CONTINUED PRETRAINING")
+    print("=" * 72)
+    print(f"Shards discovered: {len(shards)}")
+    for index, (kind, name, _) in enumerate(shards):
+        print(f"  [{index:02d}] {kind}: {name}")
+    print(f"Device: {device}")
+    print("=" * 72)
 
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    latest_path = args.checkpoint_dir / "latest.pt"
-    best_path = args.checkpoint_dir / "best_model.pt"
+    checkpoint_path = args.checkpoint_dir / "latest.pt"
 
-    current_epoch = 1
-    next_batch = 0
-    global_step = 0
-    best_validation_loss = math.inf
-
-    if latest_path.exists() and not args.no_auto_resume:
-        state = load_checkpoint(
-            model,
-            optimizer,
-            latest_path,
-            map_location=device,
-            scheduler=scheduler,
-            restore_rng=True,
-        )
-        global_step = int(state)
-        current_epoch = int(state.get("epoch", 1))
-        next_batch = int(state.get("batch_index", 0))
-        if state.get("best_validation_loss") is not None:
-            best_validation_loss = float(state["best_validation_loss"])
-        print(
-            f"Auto-resumed from {latest_path}: epoch={current_epoch}, "
-            f"next_batch={next_batch}, step={global_step}"
-        )
-    else:
-        _load_pretrained_weights(model, args.pretrained_checkpoint, device)
-        print("Starting a new continued-pretraining run from the Phase 7 weights.")
-
-    if current_epoch > args.epochs:
-        print(f"Checkpoint already reached epoch {current_epoch}; target is {args.epochs}.")
-        return
-
-    print(
-        f"Dataset: continued_pretraining | train={len(train_dataset):,} | "
-        f"new_validation={len(validation_dataset):,} | "
-        f"old_validation={len(old_validation_dataset):,}"
+    model = LLM(config).to(device)
+    print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    optimizer = create_optimizer(
+        model,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
     )
-    print(f"Device: {device} | Parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"Checkpoint directory: {args.checkpoint_dir}")
 
-    for epoch in range(current_epoch, args.epochs + 1):
-        model.train()
-        optimizer.zero_grad(set_to_none=True)
-        running_loss = 0.0
-        accumulation_count = 0
-        resume_batch = next_batch if epoch == current_epoch else 0
+    state = _load_or_initialize(
+        model,
+        optimizer,
+        checkpoint_path,
+        args.pretrained_checkpoint,
+        device,
+        args.reset_run,
+    )
 
-        for batch_index, (input_ids, target_ids) in enumerate(train_loader):
-            if batch_index < resume_batch:
-                continue
+    completed_shards = state.get("completed_shards", 0) if state is not None else 0
+    resume_shard = state.get("shard_index", 0) if state is not None else 0
+    resume_batch = state.get("batch_index", 0) if state is not None else 0
+    global_step = int(state) if state is not None else 0
 
-            input_ids = input_ids.to(device, non_blocking=True)
-            target_ids = target_ids.to(device, non_blocking=True)
-            logits = model(input_ids)
-            loss = language_model_loss(logits, target_ids)
-            (loss / args.gradient_accumulation_steps).backward()
-            running_loss += loss.item()
-            accumulation_count += 1
+    if completed_shards:
+        resume_shard = completed_shards
+        resume_batch = 0
 
-            is_update = accumulation_count == args.gradient_accumulation_steps
-            is_last_batch = batch_index + 1 == len(train_loader)
-            if is_update or is_last_batch:
-                current_accumulation = accumulation_count
-                if current_accumulation < args.gradient_accumulation_steps:
-                    scale = args.gradient_accumulation_steps / current_accumulation
-                    for parameter in model.parameters():
-                        if parameter.grad is not None:
-                            parameter.grad.mul_(scale)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-                global_step += 1
-                accumulation_count = 0
+    for shard_index in range(resume_shard, len(shards)):
+        kind, name, payload = shards[shard_index]
+        print("\n" + "=" * 72)
+        print(f"SHARD {shard_index + 1}/{len(shards)}: {name}")
+        print("=" * 72)
 
-                if global_step == 1 or global_step % args.log_every == 0:
-                    average_loss = running_loss / current_accumulation
-                    print(
-                        f"Epoch {epoch}/{args.epochs} | Step {global_step} | "
-                        f"Batch {batch_index + 1}/{len(train_loader)} | "
-                        f"Loss {average_loss:.4f} | LR {optimizer.param_groups[0]['lr']:.2e}"
-                    )
-                    running_loss = 0.0
+        downloaded_path: Path | None = None
+        try:
+            if kind == "hf":
+                download_dir = args.download_dir / f"shard_{shard_index:05d}"
+                downloaded_path = download_hf_shard(
+                    args.hf_repo_id,
+                    str(payload),
+                    download_dir,
+                    repo_type=args.hf_repo_type,
+                    revision=args.hf_revision,
+                )
+                shard_path = downloaded_path
+                print(f"Downloaded one shard: {shard_path}")
+            else:
+                shard_path = Path(payload)
 
-                if global_step % args.checkpoint_every_steps == 0:
-                    save_checkpoint(
-                        model,
-                        optimizer,
-                        global_step,
-                        latest_path,
-                        epoch=epoch,
-                        batch_index=batch_index + 1,
-                        scheduler=scheduler,
-                        best_validation_loss=best_validation_loss,
-                    )
-                    print(f"Progress checkpoint saved: {latest_path}")
+            factory = _source_text_factory(shard_path, args)
+            train_loader = _build_loader(
+                factory, tokenizer, config.context_length, "train", args
+            )
+            validation_loader = _build_loader(
+                factory, tokenizer, config.context_length, "validation", args
+            )
 
-        metrics = evaluate(model, validation_loader, device=device)
-        old_metrics = evaluate(model, old_validation_loader, device=device)
-        validation_loss = metrics["loss"]
-        print(
-            f"New validation loss: {validation_loss:.4f} | "
-            f"Perplexity: {metrics['perplexity']:.2f}"
-        )
-        print(
-            f"Original validation loss: {old_metrics['loss']:.4f} | "
-            f"Perplexity: {old_metrics['perplexity']:.2f}"
-        )
-        improved = validation_loss < best_validation_loss
-        if improved:
-            best_validation_loss = validation_loss
+            shard_resume_batch = resume_batch if shard_index == resume_shard else 0
+            global_step = train_one_shard(
+                model,
+                optimizer,
+                train_loader,
+                device,
+                args,
+                checkpoint_path,
+                global_step,
+                shard_index,
+                shard_resume_batch,
+            )
+
+            validation_metrics = evaluate(model, validation_loader, device=device)
+            print(
+                f"Shard validation | loss={validation_metrics['loss']:.4f} "
+                f"perplexity={validation_metrics['perplexity']:.2f}"
+            )
+
+            epoch_checkpoint = args.checkpoint_dir / f"model_shard_{shard_index:05d}.pt"
             save_checkpoint(
                 model,
                 optimizer,
                 global_step,
-                best_path,
-                epoch=epoch,
-                batch_index=len(train_loader),
-                scheduler=scheduler,
-                best_validation_loss=best_validation_loss,
+                epoch_checkpoint,
+                batch_index=0,
+                extra_state={
+                    "shard_index": shard_index,
+                    "completed_shards": shard_index + 1,
+                    "shard_name": name,
+                    "validation_loss": validation_metrics["loss"],
+                    "validation_perplexity": validation_metrics["perplexity"],
+                },
             )
-            print(f"New best model saved: {best_path}")
+            save_checkpoint(
+                model,
+                optimizer,
+                global_step,
+                checkpoint_path,
+                batch_index=0,
+                extra_state={
+                    "shard_index": shard_index + 1,
+                    "completed_shards": shard_index + 1,
+                    "shard_name": name,
+                    "validation_loss": validation_metrics["loss"],
+                    "validation_perplexity": validation_metrics["perplexity"],
+                },
+            )
+            print(f"Completed shard {shard_index + 1}/{len(shards)}.")
+        finally:
+            if downloaded_path is not None:
+                download_root = args.download_dir / f"shard_{shard_index:05d}"
+                if download_root.exists():
+                    shutil.rmtree(download_root, ignore_errors=True)
+                    print(f"Deleted downloaded shard: {download_root}")
 
-        scheduler.step()
-        epoch_path = args.checkpoint_dir / f"model_epoch_{epoch}.pt"
-        save_checkpoint(
-            model,
-            optimizer,
-            global_step,
-            epoch_path,
-            epoch=epoch,
-            batch_index=len(train_loader),
-            scheduler=scheduler,
-            best_validation_loss=best_validation_loss,
-        )
-        save_checkpoint(
-            model,
-            optimizer,
-            global_step,
-            latest_path,
-            epoch=epoch + 1,
-            batch_index=0,
-            scheduler=scheduler,
-            best_validation_loss=best_validation_loss,
-        )
-        print(f"Epoch checkpoint saved: {epoch_path}")
+        resume_batch = 0
 
-        next_batch = 0
-
-    print(f"Continued pretraining complete. Best validation loss: {best_validation_loss:.4f}")
+    print("\nContinued pretraining complete.")
+    print(f"Final checkpoint: {checkpoint_path}")
 
 
 if __name__ == "__main__":

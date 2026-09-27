@@ -49,7 +49,7 @@ def load_token_ids(split: str = "train", dataset: str = "base"):
     )
 
 
-def create_dataset(split: str = "train", dataset: str = "base"):
+def create_dataset(split: str = "train", dataset: str = "base", stride: int | None = None):
     """Create a disk-backed dataset that tokenizes records incrementally."""
     config = ModelConfig()
     corpus_file = resolve_corpus_file(split, dataset=dataset)
@@ -61,11 +61,14 @@ def create_dataset(split: str = "train", dataset: str = "base"):
             f"model vocabulary ({config.vocab_size})"
         )
 
+    if stride is None:
+        stride = config.context_length
+
     return StreamingLanguageModelDataset(
         corpus_file=corpus_file,
         tokenizer=tokenizer,
         context_length=config.context_length,
-        stride=config.context_length,
+        stride=stride,
     )
 
 

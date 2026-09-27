@@ -8,7 +8,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from config.model_config import ModelConfig
-from data.dataset import LanguageModelDataset
+from data.dataset import load_disk_dataset
 from data.instruction_dataset import (
     DEFAULT_SFT_CATEGORIES,
     InstructionDataset,
@@ -17,7 +17,6 @@ from data.instruction_dataset import (
 )
 from data.instruction_v2_dataset import ShardedInstructionDataset
 from data.prepare_training_data import token_store_path, prepare_dataset
-from data.dataset import load_disk_dataset
 from evaluation.evaluate import evaluate
 from model.llm import LLM
 from training.checkpoint import load_checkpoint, save_checkpoint

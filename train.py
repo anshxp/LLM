@@ -5,7 +5,7 @@ import math
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 
 from config.model_config import ModelConfig
 from data.dataset import LanguageModelDataset
@@ -16,7 +16,7 @@ from data.instruction_dataset import (
     load_jsonl,
 )
 from data.instruction_v2_dataset import ShardedInstructionDataset
-from data.prepare_training_data import load_token_ids
+from data.prepare_training_data import create_dataset
 from evaluation.evaluate import evaluate
 from model.llm import LLM
 from training.checkpoint import load_checkpoint, save_checkpoint
@@ -87,9 +87,6 @@ def parse_args(args=None):
 
     parsed = parser.parse_args(args)
 
-    # Do not use ``or`` here: zero-valued CLI arguments must survive parsing so
-    # validate_args() can reject them instead of silently replacing them with a
-    # default. This is especially important for log-every and max-train-batches.
     if parsed.learning_rate is None:
         parsed.learning_rate = (
             DEFAULT_SFT_LEARNING_RATE
@@ -174,12 +171,9 @@ def build_dataset(
         )
         return InstructionDataset(records, context_length=context_length)
 
-    token_ids = load_token_ids(split, dataset=dataset_name)
-    return LanguageModelDataset(
-        token_ids=token_ids,
-        context_length=context_length,
-        stride=stride,
-    )
+    # Base/healthcare pretraining is disk-backed. The corpus is tokenized as it
+    # is iterated, so a multi-GB text file never becomes a giant Python list.
+    return create_dataset(split, dataset=dataset_name)
 
 
 def make_loader(dataset, dataset_name, batch_size, shuffle, num_workers):
@@ -188,6 +182,10 @@ def make_loader(dataset, dataset_name, batch_size, shuffle, num_workers):
         "shuffle": shuffle,
         "num_workers": num_workers,
     }
+    if isinstance(dataset, IterableDataset):
+        # PyTorch cannot shuffle an IterableDataset through DataLoader. The
+        # corpus remains sequential/disk-backed to keep RAM bounded.
+        kwargs["shuffle"] = False
     if dataset_name == "instruction":
         kwargs["collate_fn"] = collate_instruction_batch
     return DataLoader(dataset, **kwargs)
@@ -218,9 +216,6 @@ def main(args=None):
         args.instruction_categories,
     )
 
-    if len(train_dataset) == 0 or len(validation_dataset) == 0:
-        raise ValueError("Training and validation splits must contain complete sequences")
-
     train_loader = make_loader(
         train_dataset, args.dataset, args.batch_size, shuffle=True, num_workers=args.num_workers
     )
@@ -232,10 +227,13 @@ def main(args=None):
         num_workers=args.num_workers,
     )
 
-    print(
-        f"Dataset: {args.dataset} | train={len(train_dataset):,} | "
-        f"validation={len(validation_dataset):,}"
-    )
+    if isinstance(train_dataset, IterableDataset):
+        print("Dataset: disk-backed streaming corpus")
+    else:
+        print(
+            f"Dataset: {args.dataset} | train={len(train_dataset):,} | "
+            f"validation={len(validation_dataset):,}"
+        )
     print(f"Device: {device}")
     print(
         f"Batch size: {args.batch_size} | "
@@ -313,6 +311,7 @@ def main(args=None):
         optimizer.zero_grad(set_to_none=True)
         running_loss = 0.0
         accumulation_count = 0
+        batches_seen = 0
 
         for batch_index, (input_ids, target_ids) in enumerate(train_loader):
             if (
@@ -328,36 +327,45 @@ def main(args=None):
             (loss / args.gradient_accumulation_steps).backward()
             running_loss += loss.item()
             accumulation_count += 1
+            batches_seen += 1
 
-            is_update = accumulation_count == args.gradient_accumulation_steps
-            reached_limit = (
-                args.max_train_batches is not None
-                and batch_index + 1 >= args.max_train_batches
-            )
-            is_last_batch = batch_index + 1 == len(train_loader) or reached_limit
-
-            if is_update or is_last_batch:
-                current_accumulation = accumulation_count
-                if current_accumulation < args.gradient_accumulation_steps:
-                    scale = args.gradient_accumulation_steps / current_accumulation
-                    for parameter in model.parameters():
-                        if parameter.grad is not None:
-                            parameter.grad.mul_(scale)
-
+            if accumulation_count == args.gradient_accumulation_steps:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
-                accumulation_count = 0
 
+                average_loss = running_loss / accumulation_count
                 if global_step == 1 or global_step % args.log_every == 0:
-                    average_loss = running_loss / current_accumulation
                     print(
                         f"Epoch {display_epoch}/{args.epochs} | "
                         f"Step {global_step} | Loss {average_loss:.4f} | "
                         f"LR {optimizer.param_groups[0]['lr']:.2e}"
                     )
-                    running_loss = 0.0
+                running_loss = 0.0
+                accumulation_count = 0
+
+        # Iterable datasets do not expose a cheap __len__, so flush a partial
+        # gradient accumulation after the iterator ends or max_train_batches
+        # stops the epoch.
+        if accumulation_count > 0:
+            for parameter in model.parameters():
+                if parameter.grad is not None:
+                    parameter.grad.mul_(
+                        args.gradient_accumulation_steps / accumulation_count
+                    )
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            global_step += 1
+            print(
+                f"Epoch {display_epoch}/{args.epochs} | "
+                f"Step {global_step} | Loss {running_loss / accumulation_count:.4f} | "
+                f"LR {optimizer.param_groups[0]['lr']:.2e}"
+            )
+
+        if batches_seen == 0:
+            raise ValueError("Training dataset produced no complete sequences")
 
         metrics = evaluate(model, validation_loader, device=device)
         validation_loss = metrics["loss"]

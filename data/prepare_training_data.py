@@ -61,8 +61,9 @@ def create_dataset(split: str = "train", dataset: str = "base", stride: int | No
             f"model vocabulary ({config.vocab_size})"
         )
 
+    # Match train.py's historical defaults while keeping the corpus streaming.
     if stride is None:
-        stride = config.context_length
+        stride = 128 if split == "train" else 256
 
     return StreamingLanguageModelDataset(
         corpus_file=corpus_file,

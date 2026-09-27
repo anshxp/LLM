@@ -36,14 +36,44 @@ HEADER_STRUCT = struct.Struct("<8sQ")
 
 
 def _iter_text_chunks(path: Path, chunk_chars: int):
+    """Yield bounded chunks without cutting a Whitespace pre-tokenizer unit.
+
+    The project tokenizer is trained with Hugging Face's Whitespace pre-tokenizer.
+    That pre-tokenizer makes whitespace a safe boundary: BPE is applied independently
+    to the non-whitespace pre-tokens. We therefore keep only the small tail needed to
+    reach the next whitespace boundary instead of encoding arbitrary character slices.
+
+    This preserves whole-file tokenization while keeping peak preprocessing memory
+    proportional to chunk_chars rather than corpus size.
+    """
     if chunk_chars <= 0:
         raise ValueError("chunk_chars must be positive")
+
     with path.open("r", encoding="utf-8", errors="replace") as handle:
+        pending = ""
         while True:
-            chunk = handle.read(chunk_chars)
-            if not chunk:
+            piece = handle.read(chunk_chars)
+            if not piece:
+                if pending:
+                    yield pending
                 return
-            yield chunk
+
+            pending += piece
+            boundary = len(pending)
+            for index in range(len(pending) - 1, -1, -1):
+                if pending[index].isspace():
+                    boundary = index + 1
+                    break
+
+            if boundary == len(pending):
+                # No whitespace was found. This is normally only a very long token;
+                # keep reading until it can be emitted safely.
+                continue
+
+            chunk = pending[:boundary]
+            pending = pending[boundary:]
+            if chunk:
+                yield chunk
 
 
 def _atomic_replace(tmp_path: Path, target: Path) -> None:

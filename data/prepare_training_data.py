@@ -36,15 +36,14 @@ HEADER_STRUCT = struct.Struct("<8sQ")
 
 
 def _iter_text_chunks(path: Path, chunk_chars: int):
-    """Yield bounded chunks without cutting a Whitespace pre-tokenizer unit.
+    """Yield bounded chunks while preserving whitespace boundaries.
 
-    The project tokenizer is trained with Hugging Face's Whitespace pre-tokenizer.
-    That pre-tokenizer makes whitespace a safe boundary: BPE is applied independently
-    to the non-whitespace pre-tokens. We therefore keep only the small tail needed to
-    reach the next whitespace boundary instead of encoding arbitrary character slices.
-
-    This preserves whole-file tokenization while keeping peak preprocessing memory
-    proportional to chunk_chars rather than corpus size.
+    The project tokenizer uses Hugging Face's Whitespace pre-tokenizer. We therefore
+    avoid cutting a non-whitespace token between chunks. When a whitespace boundary
+    is found, the whitespace itself stays at the beginning of the following chunk.
+    This preserves the exact source text while keeping ordinary chunks bounded by
+    approximately ``chunk_chars``. A single token longer than ``chunk_chars`` is
+    allowed to grow the pending buffer until its terminating whitespace is found.
     """
     if chunk_chars <= 0:
         raise ValueError("chunk_chars must be positive")
@@ -59,15 +58,18 @@ def _iter_text_chunks(path: Path, chunk_chars: int):
                 return
 
             pending += piece
-            boundary = len(pending)
-            for index in range(len(pending) - 1, -1, -1):
+
+            # Keep whitespace with the following chunk. Search backwards for a
+            # boundary strictly inside pending so that we never emit an empty chunk.
+            boundary = None
+            for index in range(len(pending) - 1, 0, -1):
                 if pending[index].isspace():
-                    boundary = index + 1
+                    boundary = index
                     break
 
-            if boundary == len(pending):
-                # No whitespace was found. This is normally only a very long token;
-                # keep reading until it can be emitted safely.
+            if boundary is None:
+                # No safe boundary exists yet. This is normally a single very long
+                # token; continue reading until its terminating whitespace appears.
                 continue
 
             chunk = pending[:boundary]

@@ -36,21 +36,20 @@ HEADER_STRUCT = struct.Struct("<8sQ")
 
 
 def _iter_text_chunks(path: Path, chunk_chars: int):
-    """Yield exact-text chunks whose non-final boundaries are whitespace.
+    """Yield exact-text chunks with whitespace-safe non-final boundaries.
 
-    A boundary is selected at the last whitespace at or before the requested
-    chunk size. The boundary whitespace stays in the emitted chunk. If no
-    whitespace is available because a single token crosses the limit, the
-    token is held until whitespace is encountered; that whitespace is retained
-    as the first character of the following chunk. This keeps ordinary words
-    intact while also satisfying the long-token boundary contract.
+    Normal chunks end at the last whitespace at or before ``chunk_chars``.
+    The delimiter remains in that chunk, so joining all chunks reproduces the
+    source byte-for-byte at the decoded-text level. If no whitespace occurs
+    within the requested size, the iterator consumes the rest of the current
+    oversized token and its terminating whitespace as one chunk. This avoids
+    splitting a token while ensuring every non-final chunk ends in whitespace.
     """
     if chunk_chars <= 0:
         raise ValueError("chunk_chars must be positive")
 
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         pending = ""
-        oversize_token = False
 
         while True:
             piece = handle.read(chunk_chars)
@@ -61,40 +60,46 @@ def _iter_text_chunks(path: Path, chunk_chars: int):
 
             pending += piece
 
-            # If the buffer begins with an oversized non-whitespace token,
-            # locate its first whitespace. Emit the token separately and keep
-            # the delimiter for the next chunk.
-            if oversize_token:
-                boundary = next(
-                    (i for i, char in enumerate(pending) if char.isspace()),
-                    None,
-                )
-                if boundary is None:
-                    continue
-                yield pending[:boundary]
-                pending = pending[boundary:]
-                oversize_token = False
-                if not pending:
+            while len(pending) >= chunk_chars:
+                # Prefer the furthest whitespace boundary that does not exceed
+                # the requested chunk size. Keep that whitespace in the chunk.
+                boundary = None
+                for index in range(chunk_chars - 1, -1, -1):
+                    if pending[index].isspace():
+                        boundary = index + 1
+                        break
+
+                if boundary is not None:
+                    yield pending[:boundary]
+                    pending = pending[boundary:]
                     continue
 
-            # Keep a normal chunk within the requested size where possible.
-            if len(pending) < chunk_chars:
-                continue
+                # No whitespace exists in the requested window. Find the next
+                # whitespace, allowing one token to exceed chunk_chars. We do
+                # this by reading additional text until its delimiter appears.
+                while True:
+                    boundary = next(
+                        (index for index, char in enumerate(pending) if char.isspace()),
+                        None,
+                    )
+                    if boundary is not None:
+                        # Include the delimiter so this non-final chunk has a
+                        # safe boundary. The following chunk starts after it.
+                        yield pending[: boundary + 1]
+                        pending = pending[boundary + 1 :]
+                        break
 
-            boundary = None
-            for index in range(min(chunk_chars, len(pending)) - 1, -1, -1):
-                if pending[index].isspace():
-                    boundary = index + 1
+                    extra = handle.read(chunk_chars)
+                    if not extra:
+                        # The source ends with one unbroken token. It is the
+                        # final chunk, so no whitespace boundary is required.
+                        yield pending
+                        pending = ""
+                        return
+                    pending += extra
+
+                if len(pending) < chunk_chars:
                     break
-
-            if boundary is None:
-                # No whitespace before the limit: this is an oversized token.
-                # Hold it intact and continue until its terminating whitespace.
-                oversize_token = True
-                continue
-
-            yield pending[:boundary]
-            pending = pending[boundary:]
 
 
 def _atomic_replace(tmp_path: Path, target: Path) -> None:

@@ -8,7 +8,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from config.model_config import ModelConfig
-from data.dataset import LanguageModelDataset
+from data.dataset import load_disk_dataset
 from data.instruction_dataset import (
     DEFAULT_SFT_CATEGORIES,
     InstructionDataset,
@@ -16,7 +16,7 @@ from data.instruction_dataset import (
     load_jsonl,
 )
 from data.instruction_v2_dataset import ShardedInstructionDataset
-from data.prepare_training_data import load_token_ids
+from data.prepare_training_data import token_store_path, prepare_dataset
 from evaluation.evaluate import evaluate
 from model.llm import LLM
 from training.checkpoint import load_checkpoint, save_checkpoint
@@ -174,12 +174,13 @@ def build_dataset(
         )
         return InstructionDataset(records, context_length=context_length)
 
-    token_ids = load_token_ids(split, dataset=dataset_name)
-    return LanguageModelDataset(
-        token_ids=token_ids,
-        context_length=context_length,
-        stride=stride,
-    )
+    store = token_store_path(dataset_name, split)
+    if not store.exists():
+        raise FileNotFoundError(
+            f"Prepared token store not found: {store}. "
+            f"Run `python -m data.prepare_training_data --dataset {dataset_name}` first."
+        )
+    return load_disk_dataset(store, context_length=context_length, stride=stride)
 
 
 def make_loader(dataset, dataset_name, batch_size, shuffle, num_workers):
@@ -200,6 +201,8 @@ def main(args=None):
     torch.manual_seed(args.seed)
     device = resolve_device(args.device)
     config = ModelConfig()
+    if args.dataset in ("base", "healthcare"):
+        prepare_dataset(args.dataset)
 
     train_dataset = build_dataset(
         "train",

@@ -37,6 +37,9 @@ htmlcov/
 data/raw
 data/metadata
 data/processed
+!data/processed/
+!data/processed/token_store/
+!data/processed/token_store/**
 data/raw
 data/
 

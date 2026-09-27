@@ -1,6 +1,8 @@
 import torch
 from torch.utils.data import Dataset
 
+from data.memmap_dataset import MemmapLanguageModelDataset
+
 
 class LanguageModelDataset(Dataset):
     """Fixed-length next-token-prediction sequences over token IDs."""
@@ -35,3 +37,12 @@ class LanguageModelDataset(Dataset):
             torch.tensor(input_ids, dtype=torch.long),
             torch.tensor(target_ids, dtype=torch.long),
         )
+
+
+def load_disk_dataset(token_store, context_length, stride=None):
+    """Create a bounded-memory dataset backed by a disk token store."""
+    return MemmapLanguageModelDataset(
+        token_store=token_store,
+        context_length=context_length,
+        stride=stride,
+    )

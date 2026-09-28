@@ -7,4 +7,6 @@ def test_model_defaults_fit_small_local_model():
     assert config.context_length == 256
     assert config.embedding_dim == 256
     assert config.num_layers == 4
-    assert config.num_heads == 4
+    assert config.num_encoder_layers == 4
+    assert config.num_decoder_layers == 4
+    assert config.num_heads == 6

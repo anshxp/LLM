@@ -1,12 +1,11 @@
 import torch.nn as nn
 
-from model.attention import CausalSelfAttention
+from model.attention import CausalSelfAttention, CrossAttention
 
 
 class FeedForward(nn.Module):
     def __init__(self, embedding_dim, dropout):
         super().__init__()
-
         self.network = nn.Sequential(
             nn.Linear(embedding_dim, 4 * embedding_dim),
             nn.GELU(),
@@ -18,28 +17,38 @@ class FeedForward(nn.Module):
         return self.network(x)
 
 
-class TransformerBlock(nn.Module):
+class EncoderBlock(nn.Module):
     def __init__(self, embedding_dim, num_heads, dropout):
         super().__init__()
-
         self.layer_norm_1 = nn.LayerNorm(embedding_dim)
-
-        self.attention = CausalSelfAttention(
-            embedding_dim,
-            num_heads,
-            dropout,
-        )
-
+        self.attention = CausalSelfAttention(embedding_dim, num_heads, dropout)
         self.layer_norm_2 = nn.LayerNorm(embedding_dim)
-
-        self.feed_forward = FeedForward(
-            embedding_dim,
-            dropout,
-        )
+        self.feed_forward = FeedForward(embedding_dim, dropout)
 
     def forward(self, x):
         x = x + self.attention(self.layer_norm_1(x))
-
         x = x + self.feed_forward(self.layer_norm_2(x))
-
         return x
+
+
+class DecoderBlock(nn.Module):
+    def __init__(self, embedding_dim, num_heads, dropout):
+        super().__init__()
+        self.layer_norm_1 = nn.LayerNorm(embedding_dim)
+        self.self_attention = CausalSelfAttention(embedding_dim, num_heads, dropout)
+        self.layer_norm_2 = nn.LayerNorm(embedding_dim)
+        self.cross_attention = CrossAttention(embedding_dim, num_heads, dropout)
+        self.layer_norm_3 = nn.LayerNorm(embedding_dim)
+        self.feed_forward = FeedForward(embedding_dim, dropout)
+
+    def forward(self, x, encoder_output, causal_cross_attention=True):
+        x = x + self.self_attention(self.layer_norm_1(x))
+        x = x + self.cross_attention(
+            self.layer_norm_2(x), encoder_output, causal=causal_cross_attention
+        )
+        x = x + self.feed_forward(self.layer_norm_3(x))
+        return x
+
+
+# Backwards-compatible alias for code importing the old block name.
+TransformerBlock = EncoderBlock

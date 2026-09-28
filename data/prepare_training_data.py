@@ -20,6 +20,10 @@ TOKENIZER_FILE = Path("data/processed/tokenizer.json")
 BASE_SPLIT_FILES = SPLIT_FILES["base"]
 CORPUS_FILE = BASE_SPLIT_FILES["train"]
 
+# Keep the legacy in-memory API useful for small evaluation/debugging corpora,
+# while preventing it from accidentally loading large training corpora into RAM.
+LEGACY_IN_MEMORY_LIMIT_BYTES = 64 * 1024 * 1024
+
 
 def resolve_corpus_file(split: str = "train", dataset: str = "base") -> Path:
     """Resolve the corpus path without loading its contents into RAM."""
@@ -37,16 +41,39 @@ def resolve_corpus_file(split: str = "train", dataset: str = "base") -> Path:
 
 
 def load_token_ids(split: str = "train", dataset: str = "base"):
-    """Deprecated in-memory loader kept for compatibility.
+    """Load token IDs for small legacy/evaluation callers.
 
-    Large corpora should use ``create_dataset`` below, which streams directly
-    from disk. This function intentionally raises instead of silently loading
-    a multi-GB corpus into RAM.
+    Training must use ``create_dataset`` so multi-GB corpora remain disk-backed.
+    This compatibility function deliberately refuses corpora larger than the
+    configured safety limit instead of creating an unbounded RAM allocation.
     """
-    raise RuntimeError(
-        "load_token_ids() is disabled for large-corpus training. "
-        "Use create_dataset(), which returns a disk-backed streaming dataset."
-    )
+    config = ModelConfig()
+    corpus_file = resolve_corpus_file(split, dataset=dataset)
+
+    if not TOKENIZER_FILE.exists():
+        raise FileNotFoundError(f"Tokenizer file not found: {TOKENIZER_FILE}")
+
+    if corpus_file.stat().st_size > LEGACY_IN_MEMORY_LIMIT_BYTES:
+        raise RuntimeError(
+            f"{corpus_file} is larger than the {LEGACY_IN_MEMORY_LIMIT_BYTES // (1024 * 1024)} MB "
+            "legacy in-memory limit. Use create_dataset(), which streams directly from disk."
+        )
+
+    tokenizer = Tokenizer.from_file(TOKENIZER_FILE)
+    if len(tokenizer) != config.vocab_size:
+        raise ValueError(
+            f"Tokenizer vocabulary ({len(tokenizer)}) does not match "
+            f"model vocabulary ({config.vocab_size})"
+        )
+
+    text = corpus_file.read_text(encoding="utf-8", errors="replace")
+    token_ids = tokenizer.encode(text)
+    if len(token_ids) <= config.context_length:
+        raise ValueError(
+            f"{corpus_file} does not contain enough tokens for the configured "
+            f"context length ({config.context_length})."
+        )
+    return token_ids
 
 
 def create_dataset(split: str = "train", dataset: str = "base", stride: int | None = None):
@@ -61,7 +88,6 @@ def create_dataset(split: str = "train", dataset: str = "base", stride: int | No
             f"model vocabulary ({config.vocab_size})"
         )
 
-    # Match train.py's historical defaults while keeping the corpus streaming.
     if stride is None:
         stride = 128 if split == "train" else 256
 

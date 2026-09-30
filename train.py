@@ -1,4 +1,4 @@
-"""Training entry point for base, healthcare, and instruction SFT datasets."""
+"""Training entry point for base, healthcare, Stage 1 continued pretraining, and instruction SFT."""
 
 import argparse
 import math
@@ -16,7 +16,7 @@ from data.instruction_dataset import (
     load_jsonl,
 )
 from data.instruction_v2_dataset import ShardedInstructionDataset
-from data.prepare_training_data import create_dataset
+from data.prepare_training_data import STAGE1_PARQUET, create_dataset
 from evaluation.evaluate import evaluate
 from model.llm import LLM
 from training.checkpoint import load_checkpoint, save_checkpoint
@@ -41,11 +41,13 @@ DEFAULT_SFT_LEARNING_RATE = 5e-5
 DEFAULT_SFT_LR_MIN = 5e-6
 DEFAULT_PRETRAIN_CHECKPOINT = Path("checkpoints/phase7_run/best_model.pt")
 DEFAULT_INSTRUCTION_CATEGORIES = ",".join(sorted(DEFAULT_SFT_CATEGORIES))
+DEFAULT_STAGE1_PARQUET = STAGE1_PARQUET
+DEFAULT_CHECKPOINT_EVERY_STEPS = 100
 
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser(description="Train the RXLM language model.")
-    parser.add_argument("--dataset", choices=("base", "healthcare", "instruction"), default="base")
+    parser.add_argument("--dataset", choices=("base", "healthcare", "stage1", "instruction"), default="base")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=DEFAULT_GRADIENT_ACCUMULATION_STEPS)
     parser.add_argument("--learning-rate", type=float, default=None)
@@ -55,6 +57,7 @@ def parse_args(args=None):
     parser.add_argument("--max-train-batches", type=int, default=DEFAULT_MAX_TRAIN_BATCHES)
     parser.add_argument("--max-grad-norm", type=float, default=DEFAULT_MAX_GRAD_NORM)
     parser.add_argument("--checkpoint-dir", type=Path, default=DEFAULT_CHECKPOINT_DIR)
+    parser.add_argument("--checkpoint-every-steps", type=int, default=DEFAULT_CHECKPOINT_EVERY_STEPS)
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--num-workers", type=int, default=0)
@@ -64,6 +67,7 @@ def parse_args(args=None):
     parser.add_argument("--lr-min", type=float, default=None)
     parser.add_argument("--early-stopping-patience", type=int, default=DEFAULT_EARLY_STOPPING_PATIENCE)
     parser.add_argument("--pretrained-checkpoint", type=Path, default=None)
+    parser.add_argument("--stage1-parquet", type=Path, default=DEFAULT_STAGE1_PARQUET)
     parser.add_argument("--instruction-dir", type=Path, default=DEFAULT_INSTRUCTION_DIR)
     parser.add_argument("--instruction-categories", default=DEFAULT_INSTRUCTION_CATEGORIES)
 
@@ -117,11 +121,13 @@ def validate_args(args):
         raise ValueError("lr_min must be positive and no greater than learning_rate")
     if args.early_stopping_patience < 0:
         raise ValueError("early_stopping_patience must be non-negative")
+    if args.checkpoint_every_steps <= 0:
+        raise ValueError("checkpoint_every_steps must be positive")
     if args.dataset == "instruction" and not args.instruction_categories:
         raise ValueError("instruction_categories must not be empty")
 
 
-def build_dataset(split, dataset_name, context_length, stride, instruction_dir=None, instruction_categories=None):
+def build_dataset(split, dataset_name, context_length, stride, instruction_dir=None, instruction_categories=None, stage1_parquet=None):
     if dataset_name == "instruction":
         instruction_dir = Path(instruction_dir or DEFAULT_INSTRUCTION_DIR)
         if list(instruction_dir.glob(f"{split}-*.jsonl")):
@@ -131,7 +137,12 @@ def build_dataset(split, dataset_name, context_length, stride, instruction_dir=N
             categories=instruction_categories or DEFAULT_SFT_CATEGORIES,
         )
         return InstructionDataset(records, context_length=context_length)
-    return create_dataset(split, dataset=dataset_name, stride=stride)
+    return create_dataset(
+        split,
+        dataset=dataset_name,
+        stride=stride,
+        stage1_parquet=Path(stage1_parquet or DEFAULT_STAGE1_PARQUET),
+    )
 
 
 def make_loader(dataset, dataset_name, batch_size, shuffle, num_workers):
@@ -172,8 +183,8 @@ def main(args=None):
     device = resolve_device(args.device)
     config = ModelConfig()
 
-    train_dataset = build_dataset("train", args.dataset, config.context_length, args.train_stride, args.instruction_dir, args.instruction_categories)
-    validation_dataset = build_dataset("validation", args.dataset, config.context_length, args.eval_stride, args.instruction_dir, args.instruction_categories)
+    train_dataset = build_dataset("train", args.dataset, config.context_length, args.train_stride, args.instruction_dir, args.instruction_categories, args.stage1_parquet)
+    validation_dataset = build_dataset("validation", args.dataset, config.context_length, args.eval_stride, args.instruction_dir, args.instruction_categories, args.stage1_parquet)
     train_loader = make_loader(train_dataset, args.dataset, args.batch_size, shuffle=True, num_workers=args.num_workers)
     validation_loader = make_loader(validation_dataset, args.dataset, args.batch_size, shuffle=False, num_workers=args.num_workers)
 
@@ -192,6 +203,7 @@ def main(args=None):
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     start_epoch = 0
+    resume_batch_index = 0
     global_step = 0
     best_validation_loss = math.inf
     epochs_without_improvement = 0
@@ -211,110 +223,192 @@ def main(args=None):
     if args.resume is not None:
         resume_state = load_checkpoint(model, optimizer, args.resume, map_location=device, scheduler=scheduler)
         global_step = resume_state["step"]
-        start_epoch = resume_state["epoch"]
+        completed_epoch = int(resume_state.get("epoch", 0))
+        resume_batch_index = int(resume_state.get("batch_index", 0))
+        start_epoch = completed_epoch
         restored_best = resume_state.get("best_validation_loss")
         if restored_best is not None:
             best_validation_loss = float(restored_best)
         epochs_without_improvement = int(resume_state.get("epochs_without_improvement", 0))
-        if start_epoch >= args.epochs:
+        if resume_batch_index == 0 and start_epoch >= args.epochs:
             print(f"Checkpoint already completed {start_epoch} epoch(s); target is {args.epochs}. Nothing to train.")
             return
-        print(f"Resumed from {args.resume} at optimizer step {global_step} (completed epoch {start_epoch})")
+        print(
+            f"Resumed from {args.resume} at optimizer step {global_step}; "
+            f"completed epochs={start_epoch}, next batch in current epoch={resume_batch_index}"
+        )
 
     best_path = args.checkpoint_dir / "best_model.pt"
+    latest_path = args.checkpoint_dir / "latest.pt"
+    current_epoch = start_epoch + 1
+    last_completed_batch = resume_batch_index
 
-    for display_epoch in range(start_epoch + 1, args.epochs + 1):
-        model.train()
-        optimizer.zero_grad(set_to_none=True)
-        running_loss = 0.0
-        accumulation_count = 0
-        batches_seen = 0
-        epoch_sequences = 0
-        epoch_tokens = 0
-        epoch_start_time = time.monotonic()
+    try:
+        for display_epoch in range(start_epoch + 1, args.epochs + 1):
+            current_epoch = display_epoch
+            skip_batches = resume_batch_index if display_epoch == start_epoch + 1 else 0
+            resume_batch_index = 0
 
-        for batch_index, (input_ids, target_ids) in enumerate(train_loader):
-            if args.max_train_batches is not None and batch_index >= args.max_train_batches:
-                break
+            model.train()
+            optimizer.zero_grad(set_to_none=True)
+            running_loss = 0.0
+            accumulation_count = 0
+            batches_seen = 0
+            epoch_sequences = 0
+            epoch_tokens = 0
+            epoch_start_time = time.monotonic()
+            last_completed_batch = skip_batches
 
-            input_ids = input_ids.to(device)
-            target_ids = target_ids.to(device)
-            logits = model(input_ids)
-            loss = language_model_loss(logits, target_ids)
-            (loss / args.gradient_accumulation_steps).backward()
-            running_loss += loss.item()
-            accumulation_count += 1
-            batches_seen += 1
-            epoch_sequences += input_ids.shape[0]
-            epoch_tokens += input_ids.numel()
+            for batch_index, (input_ids, target_ids) in enumerate(train_loader):
+                if batch_index < skip_batches:
+                    continue
+                if args.max_train_batches is not None and (batch_index - skip_batches) >= args.max_train_batches:
+                    break
 
-            if accumulation_count == args.gradient_accumulation_steps:
+                input_ids = input_ids.to(device)
+                target_ids = target_ids.to(device)
+                logits = model(input_ids)
+                loss = language_model_loss(logits, target_ids)
+                (loss / args.gradient_accumulation_steps).backward()
+                running_loss += loss.item()
+                accumulation_count += 1
+                batches_seen += 1
+                epoch_sequences += input_ids.shape[0]
+                epoch_tokens += input_ids.numel()
+
+                if accumulation_count == args.gradient_accumulation_steps:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    global_step += 1
+                    average_loss = running_loss / accumulation_count
+                    if global_step == 1 or global_step % args.log_every == 0:
+                        progress = _progress_text(train_dataset, epoch_sequences, epoch_tokens, epoch_start_time)
+                        print(
+                            f"Epoch {display_epoch}/{args.epochs} | Step {global_step} | "
+                            f"Loss {average_loss:.4f} | LR {optimizer.param_groups[0]['lr']:.2e}"
+                            f"{progress}"
+                        )
+                    running_loss = 0.0
+                    accumulation_count = 0
+
+                    last_completed_batch = batch_index + 1
+                    if global_step % args.checkpoint_every_steps == 0:
+                        save_checkpoint(
+                            model,
+                            optimizer,
+                            global_step,
+                            latest_path,
+                            epoch=display_epoch - 1,
+                            batch_index=last_completed_batch,
+                            scheduler=scheduler,
+                            best_validation_loss=best_validation_loss,
+                            epochs_without_improvement=epochs_without_improvement,
+                        )
+                        print(f"Latest checkpoint saved: {latest_path} (epoch={display_epoch}, next_batch={last_completed_batch})")
+
+            if accumulation_count > 0:
+                for parameter in model.parameters():
+                    if parameter.grad is not None:
+                        parameter.grad.mul_(args.gradient_accumulation_steps / accumulation_count)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
-                average_loss = running_loss / accumulation_count
-                if global_step == 1 or global_step % args.log_every == 0:
-                    progress = _progress_text(train_dataset, epoch_sequences, epoch_tokens, epoch_start_time)
-                    print(
-                        f"Epoch {display_epoch}/{args.epochs} | Step {global_step} | "
-                        f"Loss {average_loss:.4f} | LR {optimizer.param_groups[0]['lr']:.2e}"
-                        f"{progress}"
-                    )
-                running_loss = 0.0
-                accumulation_count = 0
+                last_completed_batch = max(last_completed_batch, skip_batches + batches_seen)
+                progress = _progress_text(train_dataset, epoch_sequences, epoch_tokens, epoch_start_time)
+                print(
+                    f"Epoch {display_epoch}/{args.epochs} | Step {global_step} | "
+                    f"Loss {running_loss / accumulation_count:.4f} | "
+                    f"LR {optimizer.param_groups[0]['lr']:.2e}{progress}"
+                )
 
-        if accumulation_count > 0:
-            for parameter in model.parameters():
-                if parameter.grad is not None:
-                    parameter.grad.mul_(args.gradient_accumulation_steps / accumulation_count)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-            global_step += 1
-            progress = _progress_text(train_dataset, epoch_sequences, epoch_tokens, epoch_start_time)
-            print(
-                f"Epoch {display_epoch}/{args.epochs} | Step {global_step} | "
-                f"Loss {running_loss / accumulation_count:.4f} | "
-                f"LR {optimizer.param_groups[0]['lr']:.2e}{progress}"
+            if batches_seen == 0:
+                raise ValueError("Training dataset produced no complete sequences")
+
+            metrics = evaluate(model, validation_loader, device=device)
+            validation_loss = metrics["loss"]
+            print(f"Validation loss: {validation_loss:.4f} | Perplexity: {metrics['perplexity']:.2f}")
+
+            improved = validation_loss < best_validation_loss
+            if improved:
+                best_validation_loss = validation_loss
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+
+            scheduler.step()
+            checkpoint_path = args.checkpoint_dir / f"model_epoch_{display_epoch}.pt"
+            save_checkpoint(
+                model,
+                optimizer,
+                global_step,
+                checkpoint_path,
+                epoch=display_epoch,
+                batch_index=0,
+                scheduler=scheduler,
+                best_validation_loss=best_validation_loss,
+                epochs_without_improvement=epochs_without_improvement,
             )
+            save_checkpoint(
+                model,
+                optimizer,
+                global_step,
+                latest_path,
+                epoch=display_epoch,
+                batch_index=0,
+                scheduler=scheduler,
+                best_validation_loss=best_validation_loss,
+                epochs_without_improvement=epochs_without_improvement,
+            )
+            print(f"Checkpoint saved: {checkpoint_path}")
+            print(f"Latest checkpoint updated: {latest_path}")
 
-        if batches_seen == 0:
-            raise ValueError("Training dataset produced no complete sequences")
+            if improved:
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    global_step,
+                    best_path,
+                    epoch=display_epoch,
+                    batch_index=0,
+                    scheduler=scheduler,
+                    best_validation_loss=best_validation_loss,
+                    epochs_without_improvement=epochs_without_improvement,
+                )
+                print(f"New best model: {best_path} (validation loss={best_validation_loss:.4f})")
+            else:
+                print(f"No validation improvement for {epochs_without_improvement}/{args.early_stopping_patience} epoch(s)")
 
-        metrics = evaluate(model, validation_loader, device=device)
-        validation_loss = metrics["loss"]
-        print(f"Validation loss: {validation_loss:.4f} | Perplexity: {metrics['perplexity']:.2f}")
+            if args.early_stopping_patience > 0 and epochs_without_improvement >= args.early_stopping_patience:
+                print("Early stopping triggered.")
+                break
 
-        improved = validation_loss < best_validation_loss
-        if improved:
-            best_validation_loss = validation_loss
-            epochs_without_improvement = 0
-        else:
-            epochs_without_improvement += 1
+        print(f"Training complete. Best validation loss: {best_validation_loss:.4f}")
 
-        scheduler.step()
-        checkpoint_path = args.checkpoint_dir / f"model_epoch_{display_epoch}.pt"
-        save_checkpoint(model, optimizer, global_step, checkpoint_path, epoch=display_epoch, scheduler=scheduler, best_validation_loss=best_validation_loss, epochs_without_improvement=epochs_without_improvement)
-        print(f"Checkpoint saved: {checkpoint_path}")
+        if args.dataset == "instruction":
+            test_dataset = build_dataset("test", args.dataset, config.context_length, args.eval_stride, args.instruction_dir, args.instruction_categories, args.stage1_parquet)
+            test_loader = make_loader(test_dataset, args.dataset, args.batch_size, shuffle=False, num_workers=args.num_workers)
+            test_metrics = evaluate(model, test_loader, device=device)
+            print(f"Instruction test loss: {test_metrics['loss']:.4f} | Perplexity: {test_metrics['perplexity']:.2f}")
 
-        if improved:
-            save_checkpoint(model, optimizer, global_step, best_path, epoch=display_epoch, scheduler=scheduler, best_validation_loss=best_validation_loss, epochs_without_improvement=epochs_without_improvement)
-            print(f"New best model: {best_path} (validation loss={best_validation_loss:.4f})")
-        else:
-            print(f"No validation improvement for {epochs_without_improvement}/{args.early_stopping_patience} epoch(s)")
-
-        if args.early_stopping_patience > 0 and epochs_without_improvement >= args.early_stopping_patience:
-            print("Early stopping triggered.")
-            break
-
-    print(f"Training complete. Best validation loss: {best_validation_loss:.4f}")
-
-    if args.dataset == "instruction":
-        test_dataset = build_dataset("test", args.dataset, config.context_length, args.eval_stride, args.instruction_dir, args.instruction_categories)
-        test_loader = make_loader(test_dataset, args.dataset, args.batch_size, shuffle=False, num_workers=args.num_workers)
-        test_metrics = evaluate(model, test_loader, device=device)
-        print(f"Instruction test loss: {test_metrics['loss']:.4f} | Perplexity: {test_metrics['perplexity']:.2f}")
+    except KeyboardInterrupt:
+        save_checkpoint(
+            model,
+            optimizer,
+            global_step,
+            latest_path,
+            epoch=current_epoch - 1,
+            batch_index=last_completed_batch,
+            scheduler=scheduler,
+            best_validation_loss=best_validation_loss,
+            epochs_without_improvement=epochs_without_improvement,
+        )
+        print(
+            f"\nTraining interrupted. Latest checkpoint saved: {latest_path} "
+            f"(resume at epoch={current_epoch}, batch={last_completed_batch}, step={global_step})."
+        )
+        print(f"Resume with: python train.py --resume {latest_path}")
 
 
 if __name__ == "__main__":

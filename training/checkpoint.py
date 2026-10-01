@@ -66,9 +66,11 @@ def _atomic_torch_save(payload, path):
 
         torch.save(payload, temp_path)
 
-        with temp_path.open("rb") as temp_file:
-            os.fsync(temp_file.fileno())
-
+        # torch.save has fully closed its writer by this point. The atomic
+        # replacement below ensures readers see either the old complete
+        # checkpoint or the new complete checkpoint, never a partial target.
+        # Do not call fsync() here: Windows can reject fsync on a read-only
+        # handle with OSError(9, "Bad file descriptor").
         os.replace(temp_path, path)
         temp_path = None
     finally:

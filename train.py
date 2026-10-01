@@ -19,7 +19,7 @@ from data.instruction_v2_dataset import ShardedInstructionDataset
 from data.prepare_training_data import STAGE1_PARQUET, create_dataset
 from evaluation.evaluate import evaluate
 from model.llm import LLM
-from training.checkpoint import load_checkpoint, save_checkpoint
+from training.checkpoint import load_checkpoint, save_checkpoint, save_checkpoint_with_history
 from training.loss import language_model_loss
 from training.optimizer import create_optimizer
 
@@ -43,6 +43,7 @@ DEFAULT_PRETRAIN_CHECKPOINT = Path("checkpoints/phase7_run/best_model.pt")
 DEFAULT_INSTRUCTION_CATEGORIES = ",".join(sorted(DEFAULT_SFT_CATEGORIES))
 DEFAULT_STAGE1_PARQUET = STAGE1_PARQUET
 DEFAULT_CHECKPOINT_EVERY_STEPS = 100
+DEFAULT_CHECKPOINT_HISTORY = 5
 
 
 def parse_args(args=None):
@@ -58,6 +59,7 @@ def parse_args(args=None):
     parser.add_argument("--max-grad-norm", type=float, default=DEFAULT_MAX_GRAD_NORM)
     parser.add_argument("--checkpoint-dir", type=Path, default=DEFAULT_CHECKPOINT_DIR)
     parser.add_argument("--checkpoint-every-steps", type=int, default=DEFAULT_CHECKPOINT_EVERY_STEPS)
+    parser.add_argument("--checkpoint-history", type=int, default=DEFAULT_CHECKPOINT_HISTORY)
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--num-workers", type=int, default=0)
@@ -123,6 +125,8 @@ def validate_args(args):
         raise ValueError("early_stopping_patience must be non-negative")
     if args.checkpoint_every_steps <= 0:
         raise ValueError("checkpoint_every_steps must be positive")
+    if args.checkpoint_history < 1:
+        raise ValueError("checkpoint_history must be at least 1")
     if args.dataset == "instruction" and not args.instruction_categories:
         raise ValueError("instruction_categories must not be empty")
 
@@ -233,8 +237,10 @@ def main(args=None):
         if resume_batch_index == 0 and start_epoch >= args.epochs:
             print(f"Checkpoint already completed {start_epoch} epoch(s); target is {args.epochs}. Nothing to train.")
             return
+        resumed_from = resume_state.get("checkpoint_path", str(args.resume))
+        fallback_note = " (fallback history checkpoint)" if resume_state.get("used_fallback") else ""
         print(
-            f"Resumed from {args.resume} at optimizer step {global_step}; "
+            f"Resumed from {resumed_from}{fallback_note} at optimizer step {global_step}; "
             f"completed epochs={start_epoch}, next batch in current epoch={resume_batch_index}"
         )
 
@@ -294,7 +300,7 @@ def main(args=None):
 
                     last_completed_batch = batch_index + 1
                     if global_step % args.checkpoint_every_steps == 0:
-                        save_checkpoint(
+                        history_path = save_checkpoint_with_history(
                             model,
                             optimizer,
                             global_step,
@@ -304,8 +310,13 @@ def main(args=None):
                             scheduler=scheduler,
                             best_validation_loss=best_validation_loss,
                             epochs_without_improvement=epochs_without_improvement,
+                            keep_last=args.checkpoint_history,
                         )
-                        print(f"Latest checkpoint saved: {latest_path} (epoch={display_epoch}, next_batch={last_completed_batch})")
+                        print(
+                            f"Latest checkpoint saved: {latest_path} "
+                            f"(history={history_path.name}, keep_last={args.checkpoint_history}, "
+                            f"epoch={display_epoch}, next_batch={last_completed_batch})"
+                        )
 
             if accumulation_count > 0:
                 for parameter in model.parameters():
@@ -350,7 +361,7 @@ def main(args=None):
                 best_validation_loss=best_validation_loss,
                 epochs_without_improvement=epochs_without_improvement,
             )
-            save_checkpoint(
+            history_path = save_checkpoint_with_history(
                 model,
                 optimizer,
                 global_step,
@@ -360,9 +371,10 @@ def main(args=None):
                 scheduler=scheduler,
                 best_validation_loss=best_validation_loss,
                 epochs_without_improvement=epochs_without_improvement,
+                keep_last=args.checkpoint_history,
             )
             print(f"Checkpoint saved: {checkpoint_path}")
-            print(f"Latest checkpoint updated: {latest_path}")
+            print(f"Latest checkpoint updated: {latest_path} (history={history_path.name})")
 
             if improved:
                 save_checkpoint(

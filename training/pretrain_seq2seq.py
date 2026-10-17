@@ -53,7 +53,6 @@ def main():
                         help="Approximate token-budget heuristic; not a universal law")
     parser.add_argument("--target-data-passes", type=float, default=2.0,
                         help="Planned repetitions of the unique training split")
-    parser.add_argument("--target-data-passes", type=float, default=2.0, help="Planned repetitions of the unique train split")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
@@ -66,8 +65,6 @@ def main():
         raise ValueError("target data passes must be positive")
     if args.heads <= 0 or args.encoder_layers <= 0 or args.decoder_layers <= 0:
         raise ValueError("heads and encoder/decoder layers must be positive")
-    if args.target_data_passes <= 0:
-        raise ValueError("target data passes must be positive")
     if args.heads <= 0 or args.encoder_layers <= 0 or args.decoder_layers <= 0:
         raise ValueError("heads and encoder/decoder layer counts must be positive")
     if args.max_train_batches is not None and args.max_train_batches <= 0:

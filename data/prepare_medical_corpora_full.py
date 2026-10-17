@@ -56,7 +56,7 @@ def write_shard(rows, out: Path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=Path("/content/drive/MyDrive/LLM/medical_corpus_full"))
-    parser.add_argument("--shard-rows", type=int, default=1000)
+    parser.add_argument("--shard-rows", type=int, default=100)
     parser.add_argument("--min-chars", type=int, default=200)
     parser.add_argument("--merge", action="store_true", help="After both sources finish, merge shards into one Parquet file (requires additional Drive space)")
     args = parser.parse_args()

@@ -1,8 +1,9 @@
-"""Pretrain RXLM's encoder-decoder on a Parquet text corpus."""
+"""Pretrain RXLM encoder-decoder on the configured Parquet text corpus."""
 from __future__ import annotations
 
 import argparse
 import math
+import random
 import time
 from pathlib import Path
 
@@ -63,7 +64,7 @@ def resolve_device(name):
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def save_state(path, model, optimizer, scheduler, epoch, batch_index, step, best_val, config):
+def save_state(path, model, optimizer, scheduler, epoch, batch_index, step, best_val, config, seed):
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
         "model_state_dict": model.state_dict(),
@@ -74,6 +75,9 @@ def save_state(path, model, optimizer, scheduler, epoch, batch_index, step, best
         "step": step,
         "best_validation_loss": best_val,
         "model_config": config.__dict__,
+        "seed": seed,
+        "torch_rng_state": torch.get_rng_state(),
+        "cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
     }, path)
 
 
@@ -87,15 +91,13 @@ def evaluate(model, loader, device, max_batches=None):
                 break
             source, decoder_input, target = source.to(device), decoder_input.to(device), target.to(device)
             logits = model(source, decoder_input)
-            loss = torch.nn.functional.cross_entropy(
-                logits.reshape(-1, logits.size(-1)), target.reshape(-1)
-            )
+            loss = torch.nn.functional.cross_entropy(logits.reshape(-1, logits.size(-1)), target.reshape(-1))
             loss_sum += loss.item()
             target_tokens += target.numel()
             n += 1
     model.train(was_training)
     if n == 0:
-        raise RuntimeError("Validation split produced no pairs; check data size and tokenizer.")
+        raise RuntimeError("Validation split produced no pairs; check the corpus and split distribution.")
     mean = loss_sum / n
     return {"loss": mean, "perplexity": math.exp(min(mean, 20.0)), "batches": n, "target_tokens": target_tokens}
 
@@ -103,7 +105,10 @@ def evaluate(model, loader, device, max_batches=None):
 def main(args=None):
     args = parse_args(args)
     validate_args(args)
+    random.seed(args.seed)
     torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
     device = resolve_device(args.device)
     if not args.parquet.is_file():
         raise FileNotFoundError(f"Parquet corpus not found: {args.parquet}")
@@ -111,7 +116,9 @@ def main(args=None):
     config = ModelConfig(vocab_size=len(tokenizer), context_length=args.context_length)
     model = Seq2SeqLanguageModel(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.learning_rate * 0.1)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=args.learning_rate * 0.1
+    )
 
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     train_set = ParquetSeq2SeqDataset(args.parquet, tokenizer, args.context_length, "train")
@@ -135,12 +142,16 @@ def main(args=None):
         resume_batch = int(state.get("batch_index", 0))
         step = int(state.get("step", 0))
         best_val = float(state.get("best_validation_loss", float("inf")))
+        if "torch_rng_state" in state:
+            torch.set_rng_state(state["torch_rng_state"].cpu())
+        if torch.cuda.is_available() and state.get("cuda_rng_state_all") is not None:
+            torch.cuda.set_rng_state_all(state["cuda_rng_state_all"])
 
     print("=" * 72)
     print("RXLM encoder-decoder pretraining")
     print(f"Corpus: {args.parquet} ({args.parquet.stat().st_size / (1024**2):.2f} MiB)")
     print(f"Tokenizer: {args.tokenizer} | vocab={len(tokenizer):,}")
-    print(f"Architecture: bidirectional encoder + causal decoder + cross-attention")
+    print("Architecture: bidirectional encoder + causal decoder + cross-attention")
     print(f"Context: {args.context_length} source tokens + {args.context_length} prediction tokens")
     print(f"Parameters: {model.parameter_count():,} ({model.parameter_count()/1e6:.2f}M)")
     print(f"Device={device}; batch={args.batch_size}; accumulation={args.gradient_accumulation_steps}")
@@ -149,7 +160,7 @@ def main(args=None):
     for epoch in range(epoch_start + 1, args.epochs + 1):
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        running_loss, running_n, accumulation = 0.0, 0, 0
+        epoch_loss_sum, epoch_batches, accumulation = 0.0, 0, 0
         skipped = resume_batch if epoch == epoch_start + 1 else 0
         last_batch = skipped
         started = time.monotonic()
@@ -162,8 +173,8 @@ def main(args=None):
             logits = model(source, decoder_input)
             loss = torch.nn.functional.cross_entropy(logits.reshape(-1, logits.size(-1)), target.reshape(-1))
             (loss / args.gradient_accumulation_steps).backward()
-            running_loss += loss.item()
-            running_n += 1
+            epoch_loss_sum += loss.item()
+            epoch_batches += 1
             accumulation += 1
             last_batch = batch_i + 1
             if accumulation >= args.gradient_accumulation_steps:
@@ -172,18 +183,18 @@ def main(args=None):
                 optimizer.zero_grad(set_to_none=True)
                 accumulation = 0
                 step += 1
-            if step == 1 or (step > 0 and step % args.log_every == 0 and accumulation == 0):
+            if step > 0 and step % args.log_every == 0 and accumulation == 0:
                 snapshot = train_set.progress_snapshot()
                 print(f"epoch={epoch}/{args.epochs} step={step} loss={loss.item():.4f} "
                       f"data={snapshot['data_consumed_mb']:.1f}/{train_set.total_mb:.1f}MiB "
-                      f"tokens={snapshot['tokens_seen']:,} elapsed={time.monotonic()-started:.1f}s")
+                      f"sequences={snapshot['sequences_yielded']:,} elapsed={time.monotonic()-started:.1f}s")
             if step > 0 and step % args.checkpoint_every_steps == 0 and accumulation == 0:
-                save_state(latest, model, optimizer, scheduler, epoch - 1, last_batch, step, best_val, config)
+                save_state(latest, model, optimizer, scheduler, epoch - 1, last_batch, step, best_val, config, args.seed)
             if args.max_train_batches is not None and batch_i - skipped + 1 >= args.max_train_batches:
                 break
 
         if accumulation:
-            # Correctly normalize a partial final accumulation window.
+            # Correctly normalize the partial final accumulation window.
             scale = args.gradient_accumulation_steps / accumulation
             for parameter in model.parameters():
                 if parameter.grad is not None:
@@ -195,13 +206,15 @@ def main(args=None):
 
         val = evaluate(model, val_loader, device, max_batches=200)
         scheduler.step()
-        print(f"epoch={epoch} val_loss={val['loss']:.4f} val_ppl={val['perplexity']:.2f} "
-              f"val_batches={val['batches']} target_tokens={val['target_tokens']:,}")
-        save_state(args.checkpoint_dir / f"model_epoch_{epoch}.pt", model, optimizer, scheduler, epoch, 0, step, best_val, config)
-        save_state(latest, model, optimizer, scheduler, epoch, 0, step, best_val, config)
+        train_loss = epoch_loss_sum / max(1, epoch_batches)
+        print(f"epoch={epoch} train_loss={train_loss:.4f} val_loss={val['loss']:.4f} "
+              f"val_ppl={val['perplexity']:.2f} val_batches={val['batches']} "
+              f"target_tokens={val['target_tokens']:,}")
+        save_state(args.checkpoint_dir / f"model_epoch_{epoch}.pt", model, optimizer, scheduler, epoch, 0, step, best_val, config, args.seed)
+        save_state(latest, model, optimizer, scheduler, epoch, 0, step, best_val, config, args.seed)
         if val["loss"] < best_val:
             best_val = val["loss"]
-            save_state(best_path, model, optimizer, scheduler, epoch, 0, step, best_val, config)
+            save_state(best_path, model, optimizer, scheduler, epoch, 0, step, best_val, config, args.seed)
             print(f"New best checkpoint: {best_path}")
         if args.max_train_batches is not None:
             print("Smoke-test batch limit reached; this was not a full epoch.")

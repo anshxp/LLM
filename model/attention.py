@@ -7,8 +7,7 @@ class MultiHeadAttention(nn.Module):
         if embedding_dim % num_heads: raise ValueError("embedding_dim must be divisible by num_heads")
         self.embedding_dim=embedding_dim; self.num_heads=num_heads; self.head_dim=embedding_dim//num_heads
         self.q_proj=nn.Linear(embedding_dim,embedding_dim); self.k_proj=nn.Linear(embedding_dim,embedding_dim)
-        self.v_proj=nn.Linear(embedding_dim,embedding_dim); self.out_proj=nn.Linear(embedding_dim,embedding_dim)
-        self.dropout=nn.Dropout(dropout)
+        self.v_proj=nn.Linear(embedding_dim,embedding_dim); self.out_proj=nn.Linear(embedding_dim,embedding_dim); self.dropout=nn.Dropout(dropout)
     def forward(self,query,key_value,attention_mask=None):
         b,q_len,_=query.shape; k_len=key_value.shape[1]
         q=self.q_proj(query).view(b,q_len,self.num_heads,self.head_dim).transpose(1,2)
@@ -16,7 +15,7 @@ class MultiHeadAttention(nn.Module):
         v=self.v_proj(key_value).view(b,k_len,self.num_heads,self.head_dim).transpose(1,2)
         scores=(q@k.transpose(-2,-1))/math.sqrt(self.head_dim)
         if attention_mask is not None: scores=scores.masked_fill(~attention_mask,torch.finfo(scores.dtype).min)
-        weights=self.dropout(torch.softmax(scores,dim=-1)); out=weights@v
+        out=self.dropout(torch.softmax(scores,dim=-1))@v
         return self.out_proj(out.transpose(1,2).contiguous().view(b,q_len,self.embedding_dim))
 class SelfAttention(MultiHeadAttention):
     def __init__(self,embedding_dim,num_heads,dropout,causal=False):

@@ -24,8 +24,7 @@ class LLM(nn.Module):
         return self.decode(decoder_input_ids,self.encode(input_ids,encoder_attention_mask),encoder_attention_mask)
     @torch.no_grad()
     def generate(self,input_ids,max_new_tokens=128,bos_token_id=None,eos_token_id=None):
-        self.eval(); memory=self.encode(input_ids)
-        start=self.config.bos_token_id if bos_token_id is None else bos_token_id
+        self.eval(); memory=self.encode(input_ids); start=self.config.bos_token_id if bos_token_id is None else bos_token_id
         output=torch.full((input_ids.size(0),1),start,dtype=torch.long,device=input_ids.device)
         for _ in range(max_new_tokens):
             nxt=self.decode(output,memory)[:,-1,:].argmax(dim=-1,keepdim=True); output=torch.cat([output,nxt],dim=1)

@@ -37,31 +37,45 @@ def parquet_paths(root: Path) -> list[Path]:
 
 
 def sample_texts(paths: list[Path], max_documents: int, seed: int) -> list[str]:
-    """Read a deterministic, bounded sample; never load the full corpus into RAM."""
-    rng = random.Random(seed)
-    sample: list[str] = []
-    seen = 0
+    """Read a bounded, source-balanced sample without scanning the entire corpus."""
+    del seed  # File ordering is deterministic; source-balanced caps make the sample repeatable.
+    groups: dict[str, list[Path]] = {}
     for path in paths:
-        parquet = pq.ParquetFile(path)
-        if "text" not in parquet.schema_arrow.names:
-            raise ValueError(f"Parquet file has no 'text' column: {path}")
-        for batch in parquet.iter_batches(columns=["text"], batch_size=512):
-            for value in batch.column(0).to_pylist():
-                text = str(value or "").strip()
-                if len(text) < 20:
-                    continue
-                seen += 1
-                if len(sample) < max_documents:
+        if path.name == "medical_pretrain.parquet":
+            groups.setdefault("merged", []).append(path)
+        elif path.name.startswith("medrag_pubmed_"):
+            groups.setdefault("medrag_pubmed", []).append(path)
+        elif path.name.startswith("scientific_papers_pubmed_"):
+            groups.setdefault("scientific_papers_pubmed", []).append(path)
+        else:
+            groups.setdefault(path.stem.split("_")[0], []).append(path)
+
+    quota = max(1, max_documents // max(1, len(groups)))
+    sample: list[str] = []
+    for source, source_paths in sorted(groups.items()):
+        limit = max_documents if source == "merged" else quota
+        collected = 0
+        for path in source_paths:
+            parquet = pq.ParquetFile(path)
+            if "text" not in parquet.schema_arrow.names:
+                raise ValueError(f"Parquet file has no 'text' column: {path}")
+            for batch in parquet.iter_batches(columns=["text"], batch_size=512):
+                for value in batch.column(0).to_pylist():
+                    text = str(value or "").strip()
+                    if len(text) < 20:
+                        continue
                     sample.append(text)
-                else:
-                    # Reservoir sampling gives a representative bounded sample.
-                    j = rng.randrange(seen)
-                    if j < max_documents:
-                        sample[j] = text
+                    collected += 1
+                    if collected >= limit or len(sample) >= max_documents:
+                        break
+                if collected >= limit or len(sample) >= max_documents:
+                    break
+            if collected >= limit or len(sample) >= max_documents:
+                break
+        print(f"Tokenizer sample from {source}: {collected:,} documents")
     if not sample:
         raise ValueError("No usable text found in Parquet corpus.")
     return sample
-
 
 def batch_iterator(texts: list[str], batch_size: int = 256) -> Iterator[list[str]]:
     for i in range(0, len(texts), batch_size):

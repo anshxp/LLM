@@ -8,10 +8,10 @@ Hoffmann et al. (2022), Training Compute-Optimal Large Language Models, https://
 ## Configuration
 - Context length: 512, doubled from 256.
 - Shared token embeddings and output head.
-- Width 128; 2 encoder layers; 2 decoder layers; 4 heads.
+- Width is selected automatically from the measured token budget (candidate widths 32–384, divisible by the number of heads); `--embedding-dim` overrides this when explicitly supplied. Initial depth is 2 encoder layers and 2 decoder layers, with 4 heads.
 - Token-level span corruption masks approximately 15% of contiguous source positions; decoder reconstructs the original sequence.
 - Batch size 1, gradient accumulation 8, AdamW learning rate 1e-4.
-- The trainer computes a target budget of parameters multiplied by 20, counts target tokens consumed, and stops once that budget is reached or the epoch cap is hit.
+- The trainer first counts usable tokens with the actual tokenizer. It plans two passes over the unique training split by default (`--target-data-passes 2`), uses the approximate 20:1 token/parameter heuristic to select a feasible width, then trains for the planned token exposure or until the `--epochs` safety cap. It logs the actual tokens-per-parameter ratio; embeddings can impose a parameter floor.
 - Use validation loss and coherence evaluations to determine whether this heuristic is useful for this dataset.
 
 ## Required first step: count usable tokens
@@ -32,12 +32,12 @@ python -m training.pretrain_seq2seq --parquet "data/raw/stage 1/train.parquet" -
 
 After the smoke test and token audit:
 ```powershell
-python -m training.pretrain_seq2seq --parquet "data/raw/stage 1/train.parquet" --tokenizer data/processed/tokenizer.json --device cuda --epochs 10 --checkpoint-dir checkpoints/seq2seq_pretrain --context-length 512
+python -m training.pretrain_seq2seq --parquet "data/raw/stage 1/train.parquet" --tokenizer data/processed/tokenizer.json --device cuda --epochs 10 --target-data-passes 2 --target-tokens-per-parameter 20 --checkpoint-dir checkpoints/seq2seq_pretrain --context-length 512
 ```
 
 Resume:
 ```powershell
-python -m training.pretrain_seq2seq --parquet "data/raw/stage 1/train.parquet" --tokenizer data/processed/tokenizer.json --device cuda --epochs 10 --checkpoint-dir checkpoints/seq2seq_pretrain --context-length 512 --resume
+python -m training.pretrain_seq2seq --parquet "data/raw/stage 1/train.parquet" --tokenizer data/processed/tokenizer.json --device cuda --epochs 10 --target-data-passes 2 --target-tokens-per-parameter 20 --checkpoint-dir checkpoints/seq2seq_pretrain --context-length 512 --resume
 ```
 
 Old decoder-only checkpoints are not compatible and are not loaded. These commits prepare the pipeline but do not execute training or create trained checkpoints.

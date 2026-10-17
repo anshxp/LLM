@@ -3,11 +3,10 @@ from dataclasses import dataclass
 
 @dataclass
 class ModelConfig:
-    # Keep the existing 10k tokenizer so the prepared 318 MB corpus can be reused.
     vocab_size: int = 10000
-    context_length: int = 512
+    context_length: int = 256
     embedding_dim: int = 256
-    num_layers: int = 4  # backward-compatible field
+    num_layers: int = 4
     num_encoder_layers: int = 4
     num_decoder_layers: int = 4
     num_heads: int = 4

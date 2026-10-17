@@ -113,6 +113,10 @@ def main():
         print(f"{source}: finished in {time.time() - started:.1f}s; source rows consumed={consumed:,}")
 
     if args.merge:
+        incomplete = [name for name, state in manifest["sources"].items() if not state.get("complete")]
+        missing = [name for name in limits if name not in manifest["sources"]]
+        if incomplete or missing:
+            raise RuntimeError(f"Cannot merge before both source limits complete; incomplete={incomplete}, missing={missing}")
         paths = sorted(args.output_dir.glob("*.parquet"))
         paths = [path for path in paths if path.name != "medical_pretrain.parquet"]
         if not paths:

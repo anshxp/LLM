@@ -27,7 +27,8 @@ class EncoderBlock(nn.Module):
         self.feed_forward = FeedForward(embedding_dim, dropout)
 
     def forward(self, x):
-        x = x + self.attention(self.layer_norm_1(x), self.layer_norm_1(x))
+        normalized = self.layer_norm_1(x)
+        x = x + self.attention(normalized, normalized)
         x = x + self.feed_forward(self.layer_norm_2(x))
         return x
 
@@ -51,5 +52,4 @@ class DecoderBlock(nn.Module):
         return x
 
 
-# Backwards-compatible alias for code importing the old block name.
 TransformerBlock = EncoderBlock

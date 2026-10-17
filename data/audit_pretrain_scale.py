@@ -1,5 +1,5 @@
 """Count actual tokenizer tokens and estimate the Chinchilla-style parameter reference."""
-import argparse, math
+import argparse
 from pathlib import Path
 import pyarrow.parquet as pq
 from data.parquet_dataset import row_to_text, _split_for_row
@@ -12,11 +12,14 @@ def main():
     p.add_argument("--target-tokens-per-parameter",type=float,default=20.0)
     a=p.parse_args()
     if not a.parquet.exists(): raise FileNotFoundError(a.parquet)
+    if a.target_tokens_per_parameter<=0: raise ValueError("target-tokens-per-parameter must be positive")
     tok=Tokenizer.from_file(a.tokenizer); counts={"train":0,"validation":0,"test":0}; rows={"train":0,"validation":0,"test":0}
     parquet=pq.ParquetFile(a.parquet)
+    row_index=0
     for batch in parquet.iter_batches(batch_size=1024):
         for row in batch.to_pylist():
-            split=_split_for_row(sum(rows.values()),row)
+            split=_split_for_row(row_index,row)
+            row_index+=1
             text=row_to_text(row)
             if text:
                 counts[split]+=len(tok.encode(text,add_eos=True)); rows[split]+=1
@@ -25,5 +28,5 @@ def main():
     for split in ("train","validation","test"):
         print(f"{split}: rows={rows[split]:,} tokens={counts[split]:,}")
     print(f"reference_parameter_budget={train_tokens/a.target_tokens_per_parameter:,.0f} at {a.target_tokens_per_parameter:g} tokens/parameter (heuristic)")
-    print("Architecture embedding floor may limit matching this target; use held-out loss to validate choices.")
+    print("The embedding table imposes a parameter floor. Choose a feasible width, then compare held-out loss; the 20:1 ratio is not a universal law.")
 if __name__=="__main__": main()

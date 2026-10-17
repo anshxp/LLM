@@ -47,7 +47,7 @@ def main():
             model.train(); losses=[]; tokens=0; started=time.time(); opt.zero_grad(set_to_none=True); pending=0
             resume_batch = int(ck.get("batch_index", 0)) if a.resume else 0
             for bi,(s,d,t,m) in enumerate(loader(train),1):
-                if epoch == start + 1 and bi <= resume_batch: continue
+                if a.resume and epoch == start and bi <= resume_batch: continue
                 if a.max_train_batches is not None and (bi-resume_batch)>a.max_train_batches: break
 
                 s,d,labels,m=s.to(device),d.to(device),t.to(device),m.to(device); logits=model(s,d,m); loss=torch.nn.functional.cross_entropy(logits.reshape(-1,vocab),labels.reshape(-1),ignore_index=-100); (loss/a.gradient_accumulation_steps).backward(); losses.append(loss.item()); tokens+=int((labels!=-100).sum()); pending+=1

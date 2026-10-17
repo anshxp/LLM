@@ -50,5 +50,4 @@ class DecoderBlock(nn.Module):
         return x
 
 
-# Backwards-compatible alias for code importing the old block name.
 TransformerBlock = EncoderBlock

@@ -1,6 +1,6 @@
 # 512-context encoder-decoder pretraining experiment
 
-This is an isolated experiment branch. It does not overwrite or reuse decoder-only checkpoints.
+This is an isolated experiment branch. It does not overwrite or reuse decoder-only checkpoints, and the legacy model/config defaults remain unchanged.
 
 ## Objective
 

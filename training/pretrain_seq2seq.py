@@ -51,6 +51,8 @@ def main():
     parser.add_argument("--checkpoint-every-steps", type=int, default=100)
     parser.add_argument("--target-tokens-per-parameter", type=float, default=20.0,
                         help="Approximate token-budget heuristic; not a universal law")
+    parser.add_argument("--target-data-passes", type=float, default=2.0,
+                        help="Planned repetitions of the unique training split")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
@@ -59,6 +61,10 @@ def main():
         raise ValueError("epochs, batch size, accumulation, and checkpoint interval must be positive")
     if args.target_tokens_per_parameter <= 0:
         raise ValueError("target tokens per parameter must be positive")
+    if args.target_data_passes <= 0:
+        raise ValueError("target data passes must be positive")
+    if args.heads <= 0 or args.encoder_layers <= 0 or args.decoder_layers <= 0:
+        raise ValueError("heads and encoder/decoder layer counts must be positive")
     if args.max_train_batches is not None and args.max_train_batches <= 0:
         raise ValueError("max-train-batches must be positive")
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -131,6 +137,7 @@ def main():
             "step": global_step,
             "tokens_seen": tokens_seen,
             "target_token_budget": token_budget,
+            "target_data_passes": args.target_data_passes,
             "best_validation_loss": best_validation_loss,
             "validation_loss": validation_loss,
         }, path)

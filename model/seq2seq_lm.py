@@ -2,12 +2,29 @@ import torch
 import torch.nn as nn
 
 from config.model_config import ModelConfig
+from model.attention import MultiHeadAttention
 from model.embeddings import TokenAndPositionEmbedding
-from model.transformer import DecoderBlock, EncoderBlock
+from model.transformer import DecoderBlock, FeedForward
+
+
+class Seq2SeqEncoderBlock(nn.Module):
+    """Bidirectional encoder block isolated from the legacy causal model."""
+    def __init__(self, embedding_dim, num_heads, dropout):
+        super().__init__()
+        self.layer_norm_1 = nn.LayerNorm(embedding_dim)
+        self.attention = MultiHeadAttention(embedding_dim, num_heads, dropout)
+        self.layer_norm_2 = nn.LayerNorm(embedding_dim)
+        self.feed_forward = FeedForward(embedding_dim, dropout)
+
+    def forward(self, x):
+        normalized = self.layer_norm_1(x)
+        x = x + self.attention(normalized, normalized)
+        x = x + self.feed_forward(self.layer_norm_2(x))
+        return x
 
 
 class Seq2SeqLanguageModel(nn.Module):
-    """Encoder-decoder LM: a 512-token source predicts a future target segment."""
+    """Encoder-decoder LM: a source segment predicts the future target segment."""
 
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -16,7 +33,7 @@ class Seq2SeqLanguageModel(nn.Module):
             config.vocab_size, config.context_length, config.embedding_dim
         )
         self.encoder_blocks = nn.ModuleList([
-            EncoderBlock(config.embedding_dim, config.num_heads, config.dropout)
+            Seq2SeqEncoderBlock(config.embedding_dim, config.num_heads, config.dropout)
             for _ in range(config.num_encoder_layers)
         ])
         self.decoder_blocks = nn.ModuleList([

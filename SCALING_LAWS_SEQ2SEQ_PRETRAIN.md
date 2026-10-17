@@ -41,3 +41,16 @@ python -m training.pretrain_seq2seq --parquet "data/raw/stage 1/train.parquet" -
 ```
 
 Old decoder-only checkpoints are not compatible and are not loaded. These commits prepare the pipeline but do not execute training or create trained checkpoints.
+
+
+## Medical corpus source selection (Colab)
+
+The companion workflow is documented in [COLAB_MEDICAL_PRETRAIN.md](COLAB_MEDICAL_PRETRAIN.md). The bounded pilot uses:
+1. MedRAG PubMed streamed from `MedRAG/pubmed` (primary source).
+2. A limited `pubmed` subset of `armanc/scientific_papers` (secondary source).
+
+Run `python -m data.prepare_medical_corpora --help` for options. Default pilot limits are 20,000 MedRAG rows and 10,000 scientific-papers rows; these are source rows, not guaranteed usable documents. Data is written as resumable Parquet shards to Google Drive and merged to `medical_pretrain.parquet` after both source limits complete. Keep the tokenizer and all checkpoints on Drive too.
+
+**License caveat:** the scientific_papers repository's license metadata has been reported as unknown. Verify the current dataset card and underlying article licenses before training or redistributing outputs. Do not assume permission for commercial use.
+
+For this medical experiment, use these corpora for denoising pretraining only. Keep medical QA datasets for a later SFT phase and keep evaluation examples isolated. Run a sample-schema check, token audit, and two-batch smoke test before increasing corpus limits.

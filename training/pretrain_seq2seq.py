@@ -43,7 +43,7 @@ def main():
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--context-length", type=int, default=512)
-    parser.add_argument("--embedding-dim", type=int, default=128)
+    parser.add_argument("--embedding-dim", type=int, default=None, help="Override auto-scaled model width")
     parser.add_argument("--encoder-layers", type=int, default=2)
     parser.add_argument("--decoder-layers", type=int, default=2)
     parser.add_argument("--heads", type=int, default=4)
@@ -53,6 +53,7 @@ def main():
                         help="Approximate token-budget heuristic; not a universal law")
     parser.add_argument("--target-data-passes", type=float, default=2.0,
                         help="Planned repetitions of the unique training split")
+    parser.add_argument("--target-data-passes", type=float, default=2.0, help="Planned repetitions of the unique train split")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
@@ -61,6 +62,10 @@ def main():
         raise ValueError("epochs, batch size, accumulation, and checkpoint interval must be positive")
     if args.target_tokens_per_parameter <= 0:
         raise ValueError("target tokens per parameter must be positive")
+    if args.target_data_passes <= 0:
+        raise ValueError("target data passes must be positive")
+    if args.heads <= 0 or args.encoder_layers <= 0 or args.decoder_layers <= 0:
+        raise ValueError("heads and encoder/decoder layers must be positive")
     if args.target_data_passes <= 0:
         raise ValueError("target data passes must be positive")
     if args.heads <= 0 or args.encoder_layers <= 0 or args.decoder_layers <= 0:
@@ -75,9 +80,28 @@ def main():
         raise FileNotFoundError(f"Parquet not found: {args.parquet}")
 
     tokenizer = Tokenizer.from_file(args.tokenizer)
+    usable_tokens, usable_rows = count_usable_tokens(args.parquet, tokenizer, args.context_length)
+    train_tokens = usable_tokens["train"]
+    if train_tokens <= 0:
+        raise ValueError("No usable training tokens found; inspect Parquet schema/tokenizer")
+    planned_tokens = math.ceil(train_tokens * args.target_data_passes)
+    parameter_budget = planned_tokens / args.target_tokens_per_parameter
+    widths = [width for width in range(32, 385, 16) if width % args.heads == 0]
+    def estimate_parameters(width):
+        vocab, context = len(tokenizer), args.context_length
+        encoder = args.encoder_layers * (12 * width * width + 13 * width)
+        decoder = args.decoder_layers * (16 * width * width + 19 * width)
+        return (vocab + context) * width + encoder + decoder + 4 * width
+    if args.embedding_dim is None:
+        fitting = [width for width in widths if estimate_parameters(width) <= parameter_budget]
+        embedding_dim = max(fitting) if fitting else min(widths)
+    else:
+        embedding_dim = args.embedding_dim
+        if embedding_dim % args.heads:
+            raise ValueError("embedding-dim must be divisible by heads")
     config = Seq2SeqConfig(
         vocab_size=len(tokenizer), context_length=args.context_length,
-        embedding_dim=args.embedding_dim, num_heads=args.heads,
+        embedding_dim=embedding_dim, num_heads=args.heads,
         num_encoder_layers=args.encoder_layers, num_decoder_layers=args.decoder_layers,
         dropout=0.1,
     )
@@ -87,8 +111,12 @@ def main():
     parameter_count = sum(p.numel() for p in model.parameters())
     token_budget = math.ceil(parameter_count * args.target_tokens_per_parameter)
     print(f"Device={device} | Parameters={parameter_count:,} | Vocab={config.vocab_size:,}")
-    print(f"Context={config.context_length} | Encoder={config.num_encoder_layers} | Decoder={config.num_decoder_layers} | Heads={config.num_heads}")
-    print(f"Target token budget={token_budget:,} ({args.target_tokens_per_parameter:g} tokens/parameter reference)")
+    print(f"Usable train tokens/pass={train_tokens:,} | planned tokens={planned_tokens:,} ({args.target_data_passes:g} passes) | rows={usable_rows['train']:,}")
+    print(f"Reference parameter budget={parameter_budget:,.0f} at {args.target_tokens_per_parameter:g} tokens/parameter (heuristic)")
+    print(f"Context={config.context_length} | Width={config.embedding_dim} | Encoder={config.num_encoder_layers} | Decoder={config.num_decoder_layers} | Heads={config.num_heads}")
+    if parameter_count > parameter_budget:
+        print("WARNING: embedding/model minimum exceeds the heuristic parameter budget.")
+    print(f"Target token budget={token_budget:,} ({args.target_tokens_per_parameter:g} tokens/parameter heuristic)")
     print("This is span-denoising pretraining, not decoder-only next-token pretraining.")
 
     train_ds = DenoisingParquetDataset(args.parquet, tokenizer, config.context_length, "train", seed=args.seed)

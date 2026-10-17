@@ -106,14 +106,14 @@ def main():
     random.seed(args.seed)
     model = Seq2SeqLLM(config).to(device)
     parameter_count = sum(p.numel() for p in model.parameters())
-    token_budget = min(math.ceil(parameter_count * args.target_tokens_per_parameter), planned_tokens)
+    token_budget = planned_tokens
     print(f"Device={device} | Parameters={parameter_count:,} | Vocab={config.vocab_size:,}")
     print(f"Usable train tokens/pass={train_tokens:,} | planned tokens={planned_tokens:,} ({args.target_data_passes:g} passes) | rows={usable_rows['train']:,}")
     print(f"Reference parameter budget={parameter_budget:,.0f} at {args.target_tokens_per_parameter:g} tokens/parameter (heuristic)")
     print(f"Context={config.context_length} | Width={config.embedding_dim} | Encoder={config.num_encoder_layers} | Decoder={config.num_decoder_layers} | Heads={config.num_heads}")
     if parameter_count > parameter_budget:
         print("WARNING: embedding/model minimum exceeds the heuristic parameter budget.")
-    print(f"Target token budget={token_budget:,} ({args.target_tokens_per_parameter:g} tokens/parameter heuristic)")
+    print(f"Target training exposure={token_budget:,} tokens ({args.target_data_passes:g} corpus passes); actual tokens/parameter={token_budget / parameter_count:.2f}")
     print("This is span-denoising pretraining, not decoder-only next-token pretraining.")
 
     train_ds = DenoisingParquetDataset(args.parquet, tokenizer, config.context_length, "train", seed=args.seed)

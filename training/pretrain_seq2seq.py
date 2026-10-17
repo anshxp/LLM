@@ -68,6 +68,7 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--context-length", type=int, default=512)
     parser.add_argument("--embedding-dim", type=int, default=None, help="Override auto-scaled model width")
+    parser.add_argument("--auto-architecture", action="store_true", help="Search width/depth/head candidates under the token-derived parameter budget")
     parser.add_argument("--encoder-layers", type=int, default=2)
     parser.add_argument("--decoder-layers", type=int, default=2)
     parser.add_argument("--heads", type=int, default=4)
@@ -107,23 +108,47 @@ def main():
         raise ValueError("No usable training tokens found; inspect Parquet schema/tokenizer")
     planned_tokens = math.ceil(train_tokens * args.target_data_passes)
     parameter_budget = planned_tokens / args.target_tokens_per_parameter
-    widths = [width for width in range(32, 385, 16) if width % args.heads == 0]
-    def estimate_parameters(width):
-        vocab, context = len(tokenizer), args.context_length
-        encoder = args.encoder_layers * (12 * width * width + 13 * width)
-        decoder = args.decoder_layers * (16 * width * width + 19 * width)
+    def estimate_parameters(width, encoder_layers, decoder_layers, vocab, context):
+        # Approximation for this implementation; the instantiated model count is printed below.
+        encoder = encoder_layers * (12 * width * width + 13 * width)
+        decoder = decoder_layers * (16 * width * width + 19 * width)
         return (vocab + context) * width + encoder + decoder + 4 * width
-    if args.embedding_dim is None:
-        fitting = [width for width in widths if estimate_parameters(width) <= parameter_budget]
-        embedding_dim = max(fitting) if fitting else min(widths)
+
+    vocab_size = len(tokenizer)
+    if args.auto_architecture and args.embedding_dim is not None:
+        raise ValueError("Do not combine --auto-architecture with --embedding-dim")
+    if args.auto_architecture:
+        candidates = []
+        for heads in (4, 8):
+            for width in range(32, 385, 16):
+                if width % heads:
+                    continue
+                for enc_layers in (2, 4, 6):
+                    for dec_layers in (2, 4, 6):
+                        params = estimate_parameters(width, enc_layers, dec_layers, vocab_size, args.context_length)
+                        if params <= parameter_budget:
+                            candidates.append((params, width, heads, enc_layers, dec_layers))
+        if candidates:
+            _, embedding_dim, selected_heads, selected_enc_layers, selected_dec_layers = max(candidates)
+        else:
+            # Vocabulary embeddings can exceed the heuristic budget even at the smallest model.
+            options = [(estimate_parameters(32, 2, 2, vocab_size, args.context_length), 32, 4, 2, 2)]
+            _, embedding_dim, selected_heads, selected_enc_layers, selected_dec_layers = options[0]
     else:
-        embedding_dim = args.embedding_dim
-        if embedding_dim % args.heads:
-            raise ValueError("embedding-dim must be divisible by heads")
+        selected_heads, selected_enc_layers, selected_dec_layers = args.heads, args.encoder_layers, args.decoder_layers
+        if args.embedding_dim is None:
+            widths = [width for width in range(32, 385, 16) if width % selected_heads == 0]
+            fitting = [width for width in widths if estimate_parameters(width, selected_enc_layers, selected_dec_layers, vocab_size, args.context_length) <= parameter_budget]
+            embedding_dim = max(fitting) if fitting else min(widths)
+        else:
+            embedding_dim = args.embedding_dim
+            if embedding_dim % selected_heads:
+                raise ValueError("embedding-dim must be divisible by heads")
+
     config = Seq2SeqConfig(
-        vocab_size=len(tokenizer), context_length=args.context_length,
-        embedding_dim=embedding_dim, num_heads=args.heads,
-        num_encoder_layers=args.encoder_layers, num_decoder_layers=args.decoder_layers,
+        vocab_size=vocab_size, context_length=args.context_length,
+        embedding_dim=embedding_dim, num_heads=selected_heads,
+        num_encoder_layers=selected_enc_layers, num_decoder_layers=selected_dec_layers,
         dropout=0.1,
     )
     torch.manual_seed(args.seed)
@@ -134,7 +159,7 @@ def main():
     print(f"Device={device} | Parameters={parameter_count:,} | Vocab={config.vocab_size:,}")
     print(f"Usable train tokens/pass={train_tokens:,} | planned tokens={planned_tokens:,} ({args.target_data_passes:g} passes) | rows={usable_rows['train']:,}")
     print(f"Reference parameter budget={parameter_budget:,.0f} at {args.target_tokens_per_parameter:g} tokens/parameter (heuristic)")
-    print(f"Context={config.context_length} | Width={config.embedding_dim} | Encoder={config.num_encoder_layers} | Decoder={config.num_decoder_layers} | Heads={config.num_heads}")
+    print(f"Context={config.context_length} | Width={config.embedding_dim} | Encoder={config.num_encoder_layers} | Decoder={config.num_decoder_layers} | Heads={config.num_heads} | Auto-architecture={args.auto_architecture}")
     if parameter_count > parameter_budget:
         print("WARNING: embedding/model minimum exceeds the heuristic parameter budget.")
     print(f"Target training exposure={token_budget:,} tokens ({args.target_data_passes:g} corpus passes); actual tokens/parameter={token_budget / parameter_count:.2f}")

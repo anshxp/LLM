@@ -17,7 +17,7 @@ The downloader uses Hugging Face streaming and writes small resumable Parquet sh
 
 ## Colab steps
 
-Mount Google Drive and clone the experiment branch:
+Mount Google Drive and clone the experiment branch. Copy the project tokenizer into persistent Drive storage so it survives a Colab reset:
 
 ```python
 from google.colab import drive
@@ -28,12 +28,14 @@ drive.mount("/content/drive")
 !pip install -q datasets pyarrow tokenizers
 !git clone --branch experiment/encoder-decoder-scaling-pretrain https://github.com/anshxp/LLM.git
 %cd LLM
+!mkdir -p /content/drive/MyDrive/LLM
+!cp data/processed/tokenizer.json /content/drive/MyDrive/LLM/tokenizer.json
 ```
 
 Download **both full train splits**. This may require repeated sessions:
 
 ```bash
-!python -m data.prepare_medical_corpora_full --output-dir /content/drive/MyDrive/LLM/medical_corpus_full --shard-rows 1000
+!python -m data.prepare_medical_corpora_full --output-dir /content/drive/MyDrive/LLM/medical_corpus_full --shard-rows 100
 ```
 
 Re-run that exact command after a disconnect. When both sources are complete, merge the shards into one Parquet file (requires sufficient free Drive space):

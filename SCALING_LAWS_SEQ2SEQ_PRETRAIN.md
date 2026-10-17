@@ -1,16 +1,43 @@
 # Encoder-decoder pretraining experiment
 
-This branch adds a fresh encoder-decoder architecture and span-denoising pretraining entry point.
+This branch adds an isolated encoder-decoder architecture and span-denoising pretraining entry point. The existing decoder-only/legacy model APIs are left unchanged.
 
-Scaling reference: Hoffmann et al. (2022), Training Compute-Optimal Large Language Models, https://arxiv.org/abs/2203.15556. Their approximate 20 training tokens per parameter is a heuristic, not a universal law for small-data encoder-decoder denoising. Measure actual usable tokens with the project tokenizer first.
+## Scaling-law basis
+Hoffmann et al. (2022), Training Compute-Optimal Large Language Models, https://arxiv.org/abs/2203.15556, reported a compute-optimal allocation near 20 training tokens per parameter for large language models. This is a heuristic, not a universal law for small corpora or encoder-decoder denoising. File bytes are not token count.
 
-Configuration defaults: context 512 (2x 256), vocab loaded from tokenizer, width 128, two encoder layers, two decoder layers, four heads, shared token embeddings/output head, batch 1, gradient accumulation 8, AdamW LR 1e-4.
+## Configuration
+- Context length: 512, doubled from 256.
+- Shared token embeddings and output head.
+- Width 128; 2 encoder layers; 2 decoder layers; 4 heads.
+- Token-level span corruption masks approximately 15% of contiguous source positions; decoder reconstructs the original sequence.
+- Batch size 1, gradient accumulation 8, AdamW learning rate 1e-4.
+- The trainer computes a target budget of parameters multiplied by 20, counts target tokens consumed, and stops once that budget is reached or the epoch cap is hit.
+- Use validation loss and coherence evaluations to determine whether this heuristic is useful for this dataset.
 
-Pretraining objective: 15% of source token positions are replaced by <unk>; the bidirectional encoder processes the corrupted source, and the causal decoder reconstructs the original sequence through cross-attention. This is denoising pretraining, not ordinary decoder-only next-token training. The encoder-decoder architecture is chosen because the project's desired conditional answering requires that interface, not because cross-attention alone guarantees better output.
+## Required first step: count usable tokens
+This count matches the training dataset's current behavior (skip records with fewer than 8 tokens and truncate each record to the configured context).
 
-Commands (run from repository root):
-- Smoke test: python -m training.pretrain_seq2seq --parquet "data/raw/stage 1/train.parquet" --device cuda --epochs 1 --max-train-batches 2 --checkpoint-dir checkpoints/seq2seq_smoke
-- Train: python -m training.pretrain_seq2seq --parquet "data/raw/stage 1/train.parquet" --device cuda --epochs 10 --checkpoint-dir checkpoints/seq2seq_pretrain --context-length 512
-- Resume: python -m training.pretrain_seq2seq --parquet "data/raw/stage 1/train.parquet" --device cuda --epochs 10 --checkpoint-dir checkpoints/seq2seq_pretrain --resume
+```powershell
+python -m data.audit_pretrain_scale --parquet "data/raw/stage 1/train.parquet" --tokenizer data/processed/tokenizer.json --context-length 512
+```
 
-Old decoder-only checkpoints are not compatible. This change does not start training or create checkpoints. Run the smoke test and token audit before a long run.
+The model has an embedding-table parameter floor, so the theoretical token/parameter ratio may not be achievable at a smaller width. Use the count as a constraint, not as proof of an optimum.
+
+## Commands
+
+Run the smoke test first:
+```powershell
+python -m training.pretrain_seq2seq --parquet "data/raw/stage 1/train.parquet" --device cuda --epochs 1 --max-train-batches 2 --checkpoint-dir checkpoints/seq2seq_smoke
+```
+
+After the smoke test and token audit:
+```powershell
+python -m training.pretrain_seq2seq --parquet "data/raw/stage 1/train.parquet" --tokenizer data/processed/tokenizer.json --device cuda --epochs 10 --checkpoint-dir checkpoints/seq2seq_pretrain --context-length 512
+```
+
+Resume:
+```powershell
+python -m training.pretrain_seq2seq --parquet "data/raw/stage 1/train.parquet" --tokenizer data/processed/tokenizer.json --device cuda --epochs 10 --checkpoint-dir checkpoints/seq2seq_pretrain --context-length 512 --resume
+```
+
+Old decoder-only checkpoints are not compatible and are not loaded. These commits prepare the pipeline but do not execute training or create trained checkpoints.

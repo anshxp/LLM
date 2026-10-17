@@ -3,10 +3,10 @@ import argparse,json,math,random,time
 from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
-from config.model_config import ModelConfig
+from model.seq2seq.config import Seq2SeqConfig
 from data.tokenizer import Tokenizer
 from data.denoising_dataset import DenoisingParquetDataset
-from model.llm import LLM
+from model.seq2seq.model import Seq2SeqLLM
 def collate(batch,pad_id):
     srcs,decs,tgts=zip(*batch); ms=max(map(len,srcs)); mt=max(map(len,tgts))
     src=torch.full((len(batch),ms),pad_id,dtype=torch.long); dec=torch.full((len(batch),mt),pad_id,dtype=torch.long); tgt=torch.full((len(batch),mt),-100,dtype=torch.long); mask=torch.zeros((len(batch),ms),dtype=torch.bool)
@@ -19,8 +19,8 @@ def main():
     device=torch.device("cuda" if (a.device=="cuda" or (a.device=="auto" and torch.cuda.is_available())) else "cpu")
     if not a.parquet.exists(): raise FileNotFoundError(f"Parquet not found: {a.parquet}")
     tok=Tokenizer.from_file(a.tokenizer); vocab=len(tok)
-    cfg=ModelConfig(vocab_size=vocab,context_length=a.context_length,embedding_dim=a.embedding_dim,num_heads=a.heads,num_encoder_layers=a.encoder_layers,num_decoder_layers=a.decoder_layers,num_layers=max(a.encoder_layers,a.decoder_layers),dropout=.1)
-    torch.manual_seed(a.seed); random.seed(a.seed); model=LLM(cfg).to(device); params=sum(p.numel() for p in model.parameters())
+    cfg=Seq2SeqConfig(vocab_size=vocab,context_length=a.context_length,embedding_dim=a.embedding_dim,num_heads=a.heads,num_encoder_layers=a.encoder_layers,num_decoder_layers=a.decoder_layers,num_layers=max(a.encoder_layers,a.decoder_layers),dropout=.1)
+    torch.manual_seed(a.seed); random.seed(a.seed); model=Seq2SeqLLM(cfg).to(device); params=sum(p.numel() for p in model.parameters())
     print(f"device={device} params={params:,} vocab={vocab:,} context={a.context_length}; 20-token/parameter reference={params*20:,} tokens (heuristic only)")
     train=DenoisingParquetDataset(a.parquet,tok,a.context_length,"train",seed=a.seed); valid=DenoisingParquetDataset(a.parquet,tok,a.context_length,"validation",seed=a.seed); pad=tok.token_to_id["<pad>"]
     def loader(ds): return DataLoader(ds,batch_size=a.batch_size,collate_fn=lambda b:collate(b,pad))

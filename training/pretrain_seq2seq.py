@@ -42,17 +42,21 @@ def main():
         return total/count
     hist=a.checkpoint_dir/"history.jsonl"
     with hist.open("a",encoding="utf-8") as f:
-        for epoch in range(start+1,a.epochs+1):
+        for epoch in range(start if a.resume and int(ck.get("batch_index",0))>0 else start+1,a.epochs+1):
+            train.seed=a.seed+epoch
             model.train(); losses=[]; tokens=0; started=time.time(); opt.zero_grad(set_to_none=True); pending=0
+            resume_batch = int(ck.get("batch_index", 0)) if a.resume else 0
             for bi,(s,d,t,m) in enumerate(loader(train),1):
-                if a.max_train_batches is not None and bi>a.max_train_batches: break
+                if epoch == start + 1 and bi <= resume_batch: continue
+                if a.max_train_batches is not None and (bi-resume_batch)>a.max_train_batches: break
+
                 s,d,labels,m=s.to(device),d.to(device),t.to(device),m.to(device); logits=model(s,d,m); loss=torch.nn.functional.cross_entropy(logits.reshape(-1,vocab),labels.reshape(-1),ignore_index=-100); (loss/a.gradient_accumulation_steps).backward(); losses.append(loss.item()); tokens+=int((labels!=-100).sum()); pending+=1
                 if pending==a.gradient_accumulation_steps:
                     torch.nn.utils.clip_grad_norm_(model.parameters(),1.); opt.step(); opt.zero_grad(set_to_none=True); step+=1; pending=0
-                    if step%a.checkpoint_every_steps==0: torch.save({"model_state_dict":model.state_dict(),"optimizer_state_dict":opt.state_dict(),"scheduler_state_dict":sched.state_dict(),"config":cfg.__dict__,"epoch":epoch-1,"step":step,"best_validation_loss":best},latest)
+                    if step%a.checkpoint_every_steps==0: torch.save({"model_state_dict":model.state_dict(),"optimizer_state_dict":opt.state_dict(),"scheduler_state_dict":sched.state_dict(),"config":cfg.__dict__,"epoch":epoch,"batch_index":bi,"step":step,"best_validation_loss":best},latest)
                 if bi%10==0: print(f"epoch={epoch} batch={bi} step={step} loss={loss.item():.4f} target_tokens={tokens:,}")
             if pending: torch.nn.utils.clip_grad_norm_(model.parameters(),1.); opt.step(); opt.zero_grad(set_to_none=True); step+=1
-            val=evaluate(); avg=sum(losses)/max(1,len(losses)); sched.step(); state={"model_state_dict":model.state_dict(),"optimizer_state_dict":opt.state_dict(),"scheduler_state_dict":sched.state_dict(),"config":cfg.__dict__,"epoch":epoch,"step":step,"train_loss":avg,"validation_loss":val,"best_validation_loss":min(best,val),"parameters":params}; torch.save(state,latest)
+            val=evaluate(); avg=sum(losses)/max(1,len(losses)); sched.step(); state={"model_state_dict":model.state_dict(),"optimizer_state_dict":opt.state_dict(),"scheduler_state_dict":sched.state_dict(),"config":cfg.__dict__,"epoch":epoch,"batch_index":0,"step":step,"train_loss":avg,"validation_loss":val,"best_validation_loss":min(best,val),"parameters":params}; torch.save(state,latest)
             if val<best: best=val; state["best_validation_loss"]=best; torch.save(state,bestp)
             f.write(json.dumps({"epoch":epoch,"step":step,"train_loss":avg,"validation_loss":val,"best_validation_loss":best,"target_tokens":tokens,"parameters":params,"seconds":time.time()-started})+"\n"); f.flush(); print(f"epoch={epoch} train_loss={avg:.4f} val_loss={val:.4f} best={best:.4f} tokens={tokens:,}")
 if __name__=="__main__": main()

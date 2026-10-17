@@ -13,6 +13,30 @@ from data.denoising_dataset import DenoisingParquetDataset
 from data.tokenizer import Tokenizer
 from model.seq2seq.config import Seq2SeqConfig
 from model.seq2seq.model import Seq2SeqLLM
+from data.parquet_dataset import row_to_text, _split_for_row
+
+
+def count_usable_tokens(parquet_path, tokenizer, context_length):
+    """Count rows/tokens exactly as the denoising dataset sees this Parquet."""
+    import pyarrow.parquet as pq
+
+    counts = {"train": 0, "validation": 0, "test": 0}
+    rows = {"train": 0, "validation": 0, "test": 0}
+    parquet = pq.ParquetFile(parquet_path)
+    row_index = 0
+    for batch in parquet.iter_batches(batch_size=1024):
+        for row in batch.to_pylist():
+            split = _split_for_row(row_index, row)
+            row_index += 1
+            text = row_to_text(row)
+            if not text:
+                continue
+            token_ids = tokenizer.encode(text, add_eos=True)
+            if len(token_ids) < 8:
+                continue
+            counts[split] += min(len(token_ids), context_length)
+            rows[split] += 1
+    return counts, rows
 
 
 def collate(batch, pad_id):

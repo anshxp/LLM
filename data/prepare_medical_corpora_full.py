@@ -44,7 +44,15 @@ def record_text(row: dict, source: str) -> str:
 def open_stream(source: str):
     if source == "medrag_pubmed":
         return load_dataset("MedRAG/pubmed", split="train", streaming=True)
-    return load_dataset("armanc/scientific_papers", "pubmed", split="train", streaming=True)
+    # The legacy dataset script is unsupported by recent versions of `datasets`.
+    # Use the Hugging Face-generated Parquet revision instead.
+    return load_dataset(
+        "armanc/scientific_papers",
+        "pubmed",
+        split="train",
+        streaming=True,
+        revision="refs/convert/parquet",
+    )
 
 
 def write_shard(rows, out: Path):

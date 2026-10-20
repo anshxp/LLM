@@ -1,7 +1,7 @@
 """Stream the PubMed configuration of armanc/scientific_papers into a resumable text corpus.
 
-This script intentionally handles only the second source. It does not modify or
-rebuild any existing medical corpus.
+This script handles only the second source. It does not modify or rebuild any
+existing medical corpus.
 """
 
 import json
@@ -21,7 +21,12 @@ STATE_FILE = Path("data/processed/scientific_papers_pubmed.progress.json")
 CHECKPOINT_EVERY = 100
 
 
-def _save_state(rows: int, byte_offset: int, complete: bool = False) -> None:
+def _save_state(
+    source_rows_scanned: int,
+    rows_written: int,
+    byte_offset: int,
+    complete: bool = False,
+) -> None:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     temporary = STATE_FILE.with_suffix(".json.tmp")
     temporary.write_text(
@@ -31,7 +36,8 @@ def _save_state(rows: int, byte_offset: int, complete: bool = False) -> None:
                 "config": CONFIG,
                 "split": SPLIT,
                 "revision": REVISION,
-                "rows_written": rows,
+                "source_rows_scanned": source_rows_scanned,
+                "rows_written": rows_written,
                 "byte_offset": byte_offset,
                 "complete": complete,
             },
@@ -72,14 +78,16 @@ def prepare_scientific_papers_pubmed() -> None:
         )
         return
 
+    source_rows_scanned = int(state.get("source_rows_scanned", 0))
     rows_written = int(state.get("rows_written", 0))
     byte_offset = int(state.get("byte_offset", 0))
 
     if OUTPUT_FILE.exists():
-        # Remove any data written after the last durable progress checkpoint.
+        # Discard bytes written after the last durable progress checkpoint.
         with OUTPUT_FILE.open("r+b") as output:
             output.truncate(byte_offset)
     else:
+        source_rows_scanned = 0
         rows_written = 0
         byte_offset = 0
 
@@ -95,50 +103,57 @@ def prepare_scientific_papers_pubmed() -> None:
         revision=REVISION,
     )
 
-    # Streaming resume must iterate past previously checkpointed rows.
+    # Streaming resume skips source rows, including rows with empty text.
     iterator = iter(stream)
-    for _ in range(rows_written):
+    for _ in range(source_rows_scanned):
         try:
             next(iterator)
         except StopIteration as exc:
             raise RuntimeError(
                 "The dataset ended before the saved resume position. "
-                "Move the progress file aside only if you intentionally want "
-                "to rebuild this second corpus."
+                "Check the saved progress state before restarting from zero."
             ) from exc
 
     mode = "ab" if OUTPUT_FILE.exists() else "wb"
     pending = 0
     with OUTPUT_FILE.open(mode) as output:
         for row in iterator:
+            source_rows_scanned += 1
             article = (row.get("article") or "").strip()
             abstract = (row.get("abstract") or "").strip()
-            if not article and not abstract:
-                continue
 
-            # Keep both the full article and its abstract as plain-text training data.
-            block = (article + "\n\n" + abstract + "\n\n") if article and abstract else (
-                (article or abstract) + "\n\n"
-            )
-            output.write(block.encode("utf-8", errors="replace"))
-            rows_written += 1
-            pending += 1
+            if article or abstract:
+                if article and abstract:
+                    block = f"{article}\n\n{abstract}\n\n"
+                else:
+                    block = f"{article or abstract}\n\n"
+                output.write(block.encode("utf-8", errors="replace"))
+                rows_written += 1
+                pending += 1
 
             if pending >= CHECKPOINT_EVERY:
                 output.flush()
                 os.fsync(output.fileno())
                 byte_offset = output.tell()
-                _save_state(rows_written, byte_offset)
+                _save_state(
+                    source_rows_scanned, rows_written, byte_offset
+                )
                 pending = 0
-                print(f"Rows written: {rows_written:,}")
+                print(
+                    f"Source rows scanned: {source_rows_scanned:,}; "
+                    f"records written: {rows_written:,}"
+                )
 
         output.flush()
         os.fsync(output.fileno())
         byte_offset = output.tell()
 
-    _save_state(rows_written, byte_offset, complete=True)
+    _save_state(
+        source_rows_scanned, rows_written, byte_offset, complete=True
+    )
     print(
-        f"Scientific papers PubMed corpus complete: rows={rows_written:,}; "
+        "Scientific papers PubMed corpus complete: "
+        f"source_rows={source_rows_scanned:,}; records={rows_written:,}; "
         f"bytes={byte_offset:,}; output={OUTPUT_FILE}"
     )
 

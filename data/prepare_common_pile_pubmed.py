@@ -89,61 +89,61 @@ def main():
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
 
-    committed_source_rows = int(manifest["source_rows_consumed"])
+    committed = int(manifest["source_rows_consumed"])
     usable_total = int(manifest["usable_rows_written"])
     shard_index = int(manifest["next_shard_index"])
     print(f"Dataset: {DATASET_ID}, split={SPLIT}", flush=True)
-    print(f"Output: {out}; resuming from committed source row {committed_source_rows:,}", flush=True)
+    print(f"Output: {out}; resuming from committed source row {committed:,}", flush=True)
 
     stream = load_dataset(DATASET_ID, split=SPLIT, streaming=True)
-    if committed_source_rows:
-        stream = stream.skip(committed_source_rows)
+    if committed:
+        stream = stream.skip(committed)
 
     buffer = []
     run_rows = 0
+    pending_source_rows = 0
     start = time.monotonic()
     last_log = 0
     stopped_at_limit = False
 
     for row in stream:
         run_rows += 1
+        pending_source_rows += 1
         record = convert(row)
         if record is not None:
             buffer.append(record)
 
         hit_limit = args.max_source_rows is not None and run_rows >= args.max_source_rows
-        should_write = len(buffer) >= args.shard_rows or hit_limit
+        if len(buffer) >= args.shard_rows or hit_limit:
+            if buffer:
+                filename = f"part-{shard_index:06d}.parquet"
+                target = out / filename
+                row_count = len(buffer)
+                write_shard(buffer, target)
+                shard_index += 1
+                usable_total += row_count
+                manifest["shards"].append({
+                    "file": filename, "rows": row_count, "size_bytes": target.stat().st_size,
+                })
+                buffer = []
 
-        if should_write and buffer:
-            filename = f"part-{shard_index:06d}.parquet"
-            target = out / filename
-            row_count = len(buffer)
-            write_shard(buffer, target)
-            shard_index += 1
-            usable_total += row_count
-            buffer = []
-
-            # Advance the resumable cursor only after the shard is safely written.
-            committed_source_rows += run_rows
-            manifest["source_rows_consumed"] = committed_source_rows
+            # Persist the source cursor only after all text from that range is safely on disk.
+            committed += pending_source_rows
+            pending_source_rows = 0
+            manifest["source_rows_consumed"] = committed
             manifest["usable_rows_written"] = usable_total
             manifest["next_shard_index"] = shard_index
-            manifest["shards"].append({
-                "file": filename, "rows": row_count, "size_bytes": target.stat().st_size,
-            })
             manifest["status"] = "in_progress"
             manifest["last_updated_at"] = datetime.now(timezone.utc).isoformat()
             save_manifest(manifest_path, manifest)
-            run_rows = 0
 
-        rows_since_log = committed_source_rows + run_rows - last_log
-        if rows_since_log >= args.log_every_rows or hit_limit:
+        total_seen = int(manifest["source_rows_consumed"]) + pending_source_rows
+        if total_seen - last_log >= args.log_every_rows or hit_limit:
             elapsed = max(time.monotonic() - start, 0.001)
-            total_seen = committed_source_rows + run_rows
             print(
-                f"source_rows_seen={total_seen:,} | committed_source_rows={committed_source_rows:,} | "
+                f"source_rows_seen={committed + pending_source_rows:,} | committed_source_rows={committed:,} | "
                 f"usable_rows={usable_total:,} | shards={shard_index:,} | "
-                f"elapsed={elapsed:.1f}s | rows_per_sec={total_seen / elapsed:.2f}",
+                f"elapsed={elapsed:.1f}s | rows_per_sec={run_rows / elapsed:.2f}",
                 flush=True,
             )
             last_log = total_seen
@@ -159,20 +159,16 @@ def main():
         write_shard(buffer, target)
         shard_index += 1
         usable_total += row_count
-        committed_source_rows += run_rows
-        manifest["source_rows_consumed"] = committed_source_rows
-        manifest["usable_rows_written"] = usable_total
-        manifest["next_shard_index"] = shard_index
         manifest["shards"].append({
             "file": filename, "rows": row_count, "size_bytes": target.stat().st_size,
         })
+        buffer = []
 
-    # Rows with empty text may leave run_rows nonzero without a buffer. Commit them
-    # only after we've completed the stream or intentionally reached the test cap.
-    if run_rows:
-        committed_source_rows += run_rows
-        manifest["source_rows_consumed"] = committed_source_rows
+    # Commit any trailing source rows after stream completion or an intentional test cap.
+    if pending_source_rows:
+        committed += pending_source_rows
 
+    manifest["source_rows_consumed"] = committed
     manifest["usable_rows_written"] = usable_total
     manifest["next_shard_index"] = shard_index
     manifest["last_updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -182,7 +178,7 @@ def main():
     save_manifest(manifest_path, manifest)
 
     print(
-        f"Status={manifest['status']} | source_rows_committed={committed_source_rows:,} | "
+        f"Status={manifest['status']} | source_rows_committed={committed:,} | "
         f"usable_rows={usable_total:,} | shards={shard_index:,} | "
         f"elapsed={time.monotonic() - start:.1f}s",
         flush=True,

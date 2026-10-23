@@ -1,4 +1,4 @@
-"""Download Common Pile PubMed as resumable Parquet shards; no topic filtering."""
+"""Download Common Pile PubMed into resumable Parquet shards; no topic filtering."""
 from __future__ import annotations
 
 import argparse
@@ -22,7 +22,7 @@ SCHEMA = pa.schema([
 ])
 
 
-def as_text(value):
+def to_text(value):
     if value is None:
         return None
     return value if isinstance(value, str) else str(value)
@@ -36,36 +36,34 @@ def convert(row):
     if not isinstance(metadata, dict):
         metadata = {"original_metadata": metadata}
     return {
-        "id": as_text(row.get("id")),
-        "text": text,
-        "source": as_text(row.get("source")),
-        "added": as_text(row.get("added")),
-        "created": as_text(row.get("created")),
-        "license": as_text(metadata.get("license")),
-        "source_url": as_text(metadata.get("url")),
-        "journal": as_text(metadata.get("journal")),
+        "id": to_text(row.get("id")), "text": text,
+        "source": to_text(row.get("source")), "added": to_text(row.get("added")),
+        "created": to_text(row.get("created")),
+        "license": to_text(metadata.get("license")),
+        "source_url": to_text(metadata.get("url")),
+        "journal": to_text(metadata.get("journal")),
         "authors_json": json.dumps(metadata.get("authors"), ensure_ascii=False) if metadata.get("authors") is not None else None,
         "metadata_json": json.dumps(metadata, ensure_ascii=False, sort_keys=True),
     }
 
 
-def atomic_json(path, value):
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
+def save_manifest(path, manifest):
+    temp = path.with_suffix(".json.tmp")
+    temp.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(temp, path)
 
 
 def write_shard(rows, path):
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    pq.write_table(pa.Table.from_pylist(rows, schema=SCHEMA), tmp, compression="zstd")
-    os.replace(tmp, path)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    pq.write_table(pa.Table.from_pylist(rows, schema=SCHEMA), temp, compression="zstd")
+    os.replace(temp, path)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=Path("/content/drive/MyDrive/LLM/common_pile_pubmed"))
     parser.add_argument("--shard-rows", type=int, default=1000)
-    parser.add_argument("--max-source-rows", type=int, default=None, help="Test limit; omit for full ingestion")
+    parser.add_argument("--max-source-rows", type=int, default=None, help="Limit source rows for a test; omit for full stream")
     parser.add_argument("--log-every-rows", type=int, default=1000)
     args = parser.parse_args()
     if args.shard_rows < 1 or args.log_every_rows < 1:
@@ -79,9 +77,9 @@ def main():
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if manifest.get("dataset_id") != DATASET_ID or manifest.get("split") != SPLIT:
-            raise RuntimeError("Manifest dataset/split mismatch; choose a new output directory.")
+            raise RuntimeError("Manifest dataset/split mismatch; use a new output directory.")
         if manifest.get("status") == "complete":
-            print("Dataset stream already complete.", flush=True)
+            print("Dataset stream is already complete.", flush=True)
             return
     else:
         manifest = {
@@ -91,76 +89,104 @@ def main():
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
 
-    consumed_before = int(manifest["source_rows_consumed"])
-    shard_index = int(manifest["next_shard_index"])
+    committed_source_rows = int(manifest["source_rows_consumed"])
     usable_total = int(manifest["usable_rows_written"])
-    print(f"Dataset: {DATASET_ID} split={SPLIT}", flush=True)
-    print(f"Output: {out}; resuming after {consumed_before:,} source rows", flush=True)
+    shard_index = int(manifest["next_shard_index"])
+    print(f"Dataset: {DATASET_ID}, split={SPLIT}", flush=True)
+    print(f"Output: {out}; resuming from committed source row {committed_source_rows:,}", flush=True)
 
     stream = load_dataset(DATASET_ID, split=SPLIT, streaming=True)
-    if consumed_before:
-        stream = stream.skip(consumed_before)
+    if committed_source_rows:
+        stream = stream.skip(committed_source_rows)
 
-    buffer, rows_this_run, last_log = [], 0, 0
+    buffer = []
+    run_rows = 0
     start = time.monotonic()
-    naturally_exhausted = True
+    last_log = 0
+    stopped_at_limit = False
+
     for row in stream:
-        rows_this_run += 1
+        run_rows += 1
         record = convert(row)
         if record is not None:
             buffer.append(record)
 
-        hit_limit = args.max_source_rows is not None and rows_this_run >= args.max_source_rows
-        flush = len(buffer) >= args.shard_rows or hit_limit
-        if flush and buffer:
-            name = f"part-{shard_index:06d}.parquet"
-            path = out / name
-            count = len(buffer)
-            write_shard(buffer, path)
-            manifest["shards"].append({"file": name, "rows": count, "size_bytes": path.stat().st_size})
+        hit_limit = args.max_source_rows is not None and run_rows >= args.max_source_rows
+        should_write = len(buffer) >= args.shard_rows or hit_limit
+
+        if should_write and buffer:
+            filename = f"part-{shard_index:06d}.parquet"
+            target = out / filename
+            row_count = len(buffer)
+            write_shard(buffer, target)
             shard_index += 1
-            usable_total += count
+            usable_total += row_count
             buffer = []
 
-        if rows_this_run - last_log >= args.log_every_rows or hit_limit:
-            elapsed = max(time.monotonic() - start, 0.001)
-            print(f"source_rows={consumed_before + rows_this_run:,} | usable_rows={usable_total:,} | "
-                  f"shards={shard_index:,} | rows_per_sec={rows_this_run / elapsed:.2f}", flush=True)
-            last_log = rows_this_run
+            # Advance the resumable cursor only after the shard is safely written.
+            committed_source_rows += run_rows
+            manifest["source_rows_consumed"] = committed_source_rows
+            manifest["usable_rows_written"] = usable_total
+            manifest["next_shard_index"] = shard_index
+            manifest["shards"].append({
+                "file": filename, "rows": row_count, "size_bytes": target.stat().st_size,
+            })
+            manifest["status"] = "in_progress"
+            manifest["last_updated_at"] = datetime.now(timezone.utc).isoformat()
+            save_manifest(manifest_path, manifest)
+            run_rows = 0
 
-        manifest["source_rows_consumed"] = consumed_before + rows_this_run
-        manifest["usable_rows_written"] = usable_total
-        manifest["next_shard_index"] = shard_index
-        manifest["last_updated_at"] = datetime.now(timezone.utc).isoformat()
-        manifest["status"] = "in_progress"
-        # Persist progress periodically even if a shard has not filled yet.
-        if rows_this_run % args.log_every_rows == 0 or hit_limit:
-            atomic_json(manifest_path, manifest)
+        rows_since_log = committed_source_rows + run_rows - last_log
+        if rows_since_log >= args.log_every_rows or hit_limit:
+            elapsed = max(time.monotonic() - start, 0.001)
+            total_seen = committed_source_rows + run_rows
+            print(
+                f"source_rows_seen={total_seen:,} | committed_source_rows={committed_source_rows:,} | "
+                f"usable_rows={usable_total:,} | shards={shard_index:,} | "
+                f"elapsed={elapsed:.1f}s | rows_per_sec={total_seen / elapsed:.2f}",
+                flush=True,
+            )
+            last_log = total_seen
 
         if hit_limit:
-            naturally_exhausted = False
+            stopped_at_limit = True
             break
 
     if buffer:
-        name = f"part-{shard_index:06d}.parquet"
-        path = out / name
-        count = len(buffer)
-        write_shard(buffer, path)
-        manifest["shards"].append({"file": name, "rows": count, "size_bytes": path.stat().st_size})
+        filename = f"part-{shard_index:06d}.parquet"
+        target = out / filename
+        row_count = len(buffer)
+        write_shard(buffer, target)
         shard_index += 1
-        usable_total += count
+        usable_total += row_count
+        committed_source_rows += run_rows
+        manifest["source_rows_consumed"] = committed_source_rows
+        manifest["usable_rows_written"] = usable_total
+        manifest["next_shard_index"] = shard_index
+        manifest["shards"].append({
+            "file": filename, "rows": row_count, "size_bytes": target.stat().st_size,
+        })
 
-    manifest["source_rows_consumed"] = consumed_before + rows_this_run
+    # Rows with empty text may leave run_rows nonzero without a buffer. Commit them
+    # only after we've completed the stream or intentionally reached the test cap.
+    if run_rows:
+        committed_source_rows += run_rows
+        manifest["source_rows_consumed"] = committed_source_rows
+
     manifest["usable_rows_written"] = usable_total
     manifest["next_shard_index"] = shard_index
     manifest["last_updated_at"] = datetime.now(timezone.utc).isoformat()
-    if naturally_exhausted:
+    if not stopped_at_limit:
         manifest["status"] = "complete"
         manifest["completed_at"] = datetime.now(timezone.utc).isoformat()
-    atomic_json(manifest_path, manifest)
-    print(f"Status: {manifest['status']}; source rows: {manifest['source_rows_consumed']:,}; "
-          f"usable rows: {usable_total:,}; shards: {shard_index:,}; "
-          f"elapsed: {time.monotonic() - start:.1f}s", flush=True)
+    save_manifest(manifest_path, manifest)
+
+    print(
+        f"Status={manifest['status']} | source_rows_committed={committed_source_rows:,} | "
+        f"usable_rows={usable_total:,} | shards={shard_index:,} | "
+        f"elapsed={time.monotonic() - start:.1f}s",
+        flush=True,
+    )
     print(f"Manifest: {manifest_path}", flush=True)
 
 

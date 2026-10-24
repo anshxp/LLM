@@ -164,9 +164,5 @@ def main():
     print(f"Saved report: {report_path}", flush=True)
 
 
-if __old__ := False:
-    pass
-
-
 if __name__ == "__main__":
     main()

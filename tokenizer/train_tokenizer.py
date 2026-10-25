@@ -18,16 +18,62 @@ def list_shards(data_dir: Path):
     return files
 
 
-def count_rows(files, text_column: str, max_rows: int | None) -> int:
-    """Count candidate rows from Parquet metadata without reading text into RAM."""
+def count_rows(
+    files,
+    text_column: str,
+    max_rows: int | None,
+    log_every_shards: int = 50,
+) -> int:
+    """Count candidate rows from Parquet metadata and log scan progress."""
     total = 0
-    for file in files:
-        parquet = pq.ParquetFile(file)
-        if text_column not in parquet.schema_arrow.names:
-            raise ValueError(f"Column {text_column!r} not found in {file}")
-        total += parquet.metadata.num_rows
+    started = time.monotonic()
+    shard_count = len(files)
+    print(
+        f"[metadata] Starting scan of {shard_count:,} Parquet shards "
+        f"(progress every {log_every_shards} shards).",
+        flush=True,
+    )
+
+    for index, file in enumerate(files, start=1):
+        # Log before opening the file so a slow or blocked Drive read is visible.
+        if index == 1 or (index - 1) % log_every_shards == 0:
+            elapsed = time.monotonic() - started
+            print(
+                f"[metadata] Opening shard {index:,}/{shard_count:,} "
+                f"| Rows counted: {total:,} | Elapsed: {elapsed:.1f}s "
+                f"| Current file: {file.name}",
+                flush=True,
+            )
+        try:
+            parquet = pq.ParquetFile(file)
+            if text_column not in parquet.schema_arrow.names:
+                raise ValueError(
+                    f"Column {text_column!r} not found in shard {file}"
+                )
+            total += parquet.metadata.num_rows
+        except Exception as exc:
+            elapsed = time.monotonic() - started
+            raise RuntimeError(
+                f"Metadata scan failed at shard {index}/{shard_count}: {file} "
+                f"after {elapsed:.1f}s; rows counted so far: {total:,}. "
+                "Check Google Drive mount/access and shard integrity."
+            ) from exc
+
         if max_rows is not None and total >= max_rows:
+            elapsed = time.monotonic() - started
+            print(
+                f"[metadata] Reached --max-rows={max_rows:,} at shard "
+                f"{index:,}/{shard_count:,} in {elapsed:.1f}s.",
+                flush=True,
+            )
             return max_rows
+
+    elapsed = time.monotonic() - started
+    print(
+        f"[metadata] Scan complete: {shard_count:,} shards, "
+        f"{total:,} rows, {elapsed:.1f}s.",
+        flush=True,
+    )
     return total
 
 

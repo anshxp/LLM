@@ -188,6 +188,10 @@ def ingest_corpus(db: sqlite3.Connection, args, normalizer, pre_tokenizer) -> No
             batch_chars += len(value)
         if batch_rows >= args.ingest_batch_rows:
             flush()
+        if args.max_rows is not None and rows_seen + batch_rows >= args.max_rows:
+            flush()
+            print(f"[ingest] Reached --max-rows={args.max_rows:,}; finishing bounded test corpus.", flush=True)
+            break
         now = time.monotonic()
         if now - last_log >= args.log_every_seconds:
             print(
@@ -372,6 +376,8 @@ def main() -> None:
     parser.add_argument("--vocab-size", type=int, default=300000)
     parser.add_argument("--min-frequency", type=int, default=2)
     parser.add_argument("--text-column", default="text")
+    parser.add_argument("--max-rows", type=int, default=None,
+                        help="Optional raw-row limit for smoke tests; omit for full corpus")
     parser.add_argument("--ingest-batch-rows", type=int, default=50)
     parser.add_argument("--log-every-seconds", type=int, default=30)
     args = parser.parse_args()
@@ -380,6 +386,8 @@ def main() -> None:
         parser.error("vocab size must be >=256 and min frequency must be positive")
     if args.ingest_batch_rows < 1 or args.log_every_seconds < 1:
         parser.error("batch and log intervals must be positive")
+    if args.max_rows is not None and args.max_rows < 1:
+        parser.error("--max-rows must be positive")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     db = open_db(args.state_db)
     normalizer = normalizers.NFKC()

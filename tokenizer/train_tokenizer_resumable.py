@@ -387,6 +387,27 @@ def main() -> None:
     alphabet = sorted(pre_tokenizer.alphabet())
     initialise_vocab(db, alphabet)
 
+    # Refuse to resume a state database against a different input definition.
+    # A larger --vocab-size is allowed so an existing run can continue further.
+    run_config = {
+        "dataset": args.dataset,
+        "split": args.split,
+        "text_column": args.text_column,
+        "normalizer": "NFKC",
+        "pre_tokenizer": "ByteLevel(add_prefix_space=False)",
+    }
+    for key, value in run_config.items():
+        stored = meta_get(db, "config_" + key)
+        if stored and stored != value:
+            db.close()
+            parser.error(
+                f"Checkpoint config mismatch for {key}: stored={stored!r}, requested={value!r}. "
+                "Use the original settings or a new --state-db."
+            )
+        if not stored:
+            with db:
+                meta_set(db, "config_" + key, value)
+
     try:
         phase = meta_get(db, "phase", "ingest")
         if phase == "ingest":

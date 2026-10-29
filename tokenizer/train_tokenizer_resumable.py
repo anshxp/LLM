@@ -156,7 +156,7 @@ def ingest_corpus(db: sqlite3.Connection, args, normalizer, pre_tokenizer) -> No
     last_log = started
 
     def flush() -> None:
-        nonlocal batch_rows, batch_docs, batch_chars
+        nonlocal rows_seen, documents, characters, batch_rows, batch_docs, batch_chars
         if batch_rows == 0:
             return
         with db:
@@ -167,12 +167,12 @@ def ingest_corpus(db: sqlite3.Connection, args, normalizer, pre_tokenizer) -> No
                     "ON CONFLICT(piece) DO UPDATE SET freq=freq+excluded.freq",
                     (piece, amount, symbols),
                 )
-            rows_seen_local = rows_seen + batch_rows
-            documents_local = documents + batch_docs
-            characters_local = characters + batch_chars
-            meta_set(db, "rows_seen", rows_seen_local)
-            meta_set(db, "documents", documents_local)
-            meta_set(db, "characters", characters_local)
+            rows_seen += batch_rows
+            documents += batch_docs
+            characters += batch_chars
+            meta_set(db, "rows_seen", rows_seen)
+            meta_set(db, "documents", documents)
+            meta_set(db, "characters", characters)
         batch_piece_freq.clear()
         batch_rows = batch_docs = batch_chars = 0
 
@@ -372,7 +372,7 @@ def main() -> None:
     parser.add_argument("--vocab-size", type=int, default=300000)
     parser.add_argument("--min-frequency", type=int, default=2)
     parser.add_argument("--text-column", default="text")
-    parser.add_argument("--ingest-batch-rows", type=int, default=500)
+    parser.add_argument("--ingest-batch-rows", type=int, default=50)
     parser.add_argument("--log-every-seconds", type=int, default=30)
     args = parser.parse_args()
 
